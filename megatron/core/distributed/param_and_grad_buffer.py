@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
@@ -393,6 +394,10 @@ class ParamAndGradBuffer:
             param.main_grad = self._get(
                 param.data.shape, data_start_index, buffer_type=BufferType.GRAD
             )
+            if os.environ.get('MLM_HPU_MAIN_GRAD_FLATTEN', '0') == '1':
+                param.main_grad_flatten = self._get(
+                    param.data.shape, data_start_index, buffer_type=BufferType.GRAD, flatten=True
+                )
             if bucket_id != cur_bucket_id:
                 bucket_data_end_index = _pad_end_of_bucket_if_needed(data_start_index)
                 self._set_bucket(
@@ -438,7 +443,8 @@ class ParamAndGradBuffer:
         """Scale the gradient data by `scaling_factor`."""
         self.grad_data *= scaling_factor
 
-    def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
+    def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType,
+             flatten=False) -> torch.Tensor:
         """
         Return a tensor with the input `shape` as a view into the 1-D data starting at
         `start_index`.
@@ -452,6 +458,8 @@ class ParamAndGradBuffer:
             buffer_tensor = self.grad_data[start_index:end_index]
         else:
             raise Exception("Illegal buffer type provided to GradBuffer._get() function")
+        if flatten:
+            return buffer_tensor
         buffer_tensor = buffer_tensor.view(shape)
         return buffer_tensor
 

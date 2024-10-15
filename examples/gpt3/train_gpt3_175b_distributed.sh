@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
 # Runs the "175B" parameter model
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -17,6 +19,7 @@ TENSORBOARD_LOGS_PATH=$2 #<Specify path>
 VOCAB_FILE=$3 #<Specify path to file>/gpt2-vocab.json
 MERGE_FILE=$4 #<Specify path to file>/gpt2-merges.txt
 DATA_PATH=$5 #<Specify path and file prefix>_text_document
+NUM_LAYERS=${HL_NUM_LAYERS:-96}
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 
@@ -26,7 +29,7 @@ DISTRIBUTED_ARGS=(
 )
 
 GPT_MODEL_ARGS=(
-    --num-layers 96 
+    --num-layers ${NUM_LAYERS}  
     --hidden-size 12288 
     --num-attention-heads 96 
     --seq-length 2048 
@@ -49,6 +52,7 @@ TRAINING_ARGS=(
     --min-lr 6.0e-6
     --lr-warmup-fraction .001 
     --lr-decay-iters 430000 
+    --use-mcore-models
 )
 
 MODEL_PARALLEL_ARGS=(

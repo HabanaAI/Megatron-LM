@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
@@ -440,7 +441,8 @@ class MCoreSavePlanner(DefaultSavePlanner):
 
     def create_local_plan(self) -> SavePlan:
         plan = create_default_local_save_plan(self.state_dict, self.is_coordinator)
-        self._add_non_coordinator_iobytes_request(plan)
+        if packaging.version.Version(torch.__version__) <= packaging.version.Version("2.3"):
+            self._add_non_coordinator_iobytes_request(plan)
         if self.flatten_state_dict:
             plan = dataclasses.replace(plan, planner_data=self.mappings)
         plan = MCoreSavePlan(

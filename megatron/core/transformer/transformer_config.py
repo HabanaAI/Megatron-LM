@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import types
@@ -153,6 +154,18 @@ class TransformerConfig(ModelParallelConfig):
 
     apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
+
+    use_fused_rmsnorm: bool = True
+    """If True, use Fused RMSNorm kernel."""
+
+    use_fused_sdpa: bool = True
+    """If True, Enable Fused Scaled Dot Product Attention."""
+
+    use_fused_sdpa_with_recompute: bool = False
+    """If True, Enable Fused Scaled Dot Product Attention with recompute."""
+
+    use_fast_softmax: bool = False
+    """If True, Enable fast softmax in Fused Scaled Dot Product Attention."""
 
     ####################
     # activation recomputation

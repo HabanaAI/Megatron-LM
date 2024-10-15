@@ -1,6 +1,8 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Dict, Optional
 
@@ -221,7 +223,10 @@ class DistributedDataParallel(MegatronModule):
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
-                    param.main_grad.add_(param.grad.data)
+                    if os.environ.get('MLM_HPU_MAIN_GRAD_FLATTEN', '0') == '1':
+                        param.main_grad_flatten.add_(param.grad.data.view(param.main_grad_flatten.shape))
+                    else:
+                        param.main_grad.add_(param.grad.data)
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:

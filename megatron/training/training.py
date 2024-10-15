@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain utilities."""
@@ -19,7 +20,13 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import check_param_hashes_across_dp_replicas, get_model_config, StragglerDetector
+from megatron.core.utils import (
+    check_param_hashes_across_dp_replicas,
+    get_model_config,
+    StragglerDetector,
+    is_real_cuda_device_available,
+    found_kill_switch
+)
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
@@ -28,6 +35,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+from megatron.core.profiler import setup_profiler, trigger, on_step_begin, on_step_end
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
@@ -199,8 +207,13 @@ def pretrain(train_valid_test_dataset_provider,
     if args.log_progress:
         append_to_progress_log("Starting job")
 
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    if found_kill_switch(args):
+        print_datetime(f"Detected kill switch at {args.kill_switch_file}. Exiting")
+        sys.exit()
+
+    if is_real_cuda_device_available() or int(os.getenv("PT_HPU_LAZY_MODE", "1")) != 1:
+        # Set pytorch JIT layer fusion options and warmup JIT functions.
+        set_jit_fusion_options()
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
@@ -435,7 +448,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # GPU allocation.
     for model_module in model:
+        if os.getenv("PT_HPU_LAZY_MODE", "1") == "1":
+            # store param attributes as they are lost after moving to device in lazy
+            param_attr = {}
+            for name, param in model_module.named_parameters():
+                param_attr[name] = param.__dict__
         model_module.cuda(torch.cuda.current_device())
+        if os.getenv("PT_HPU_LAZY_MODE", "1") == "1":
+            for name, param in model_module.named_parameters():
+                param.__dict__ = param_attr[name]
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
@@ -609,6 +630,7 @@ def train_step(forward_step_func, data_iterator,
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    assert grad_norm > 0. and grad_norm != float("inf"), f"{grad_norm=}"
     timers('optimizer').stop()
 
     # Vision momentum.
@@ -757,6 +779,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             writer.add_scalar(key , loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key],
                               args.consumed_train_samples)
+            writer.add_scalar(key + ' vs tokens', loss_dict[key],
+                              args.consumed_train_samples * args.seq_length)
+            writer.add_scalar(f"lm-loss-training/{key}", loss_dict[key] , iteration)
+            writer.add_scalar(f"lm-loss-training/{key}" + ' vs samples', loss_dict[key],
+                            args.consumed_train_samples)
+            writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
+                            args.consumed_train_samples * args.seq_length)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
         if args.log_loss_scale_to_tensorboard:
@@ -775,6 +804,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             writer.add_scalar('grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm vs samples', grad_norm,
                               args.consumed_train_samples)
+            writer.add_scalar('grad-norm vs tokens', grad_norm,
+                              args.consumed_train_samples * args.seq_length)
+            writer.add_scalar('grad-norm/grad-norm', grad_norm, iteration)
+            writer.add_scalar('grad-norm/grad-norm vs samples', grad_norm,
+                            args.consumed_train_samples)
+            writer.add_scalar('grad-norm/grad-norm vs tokens', grad_norm,
+                            args.consumed_train_samples * args.seq_length)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
         if num_zeros_in_grad is not None:
@@ -816,6 +852,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
 
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
+        samples_per_second = batch_size / elapsed_time_per_iteration
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -829,11 +866,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
+        log_string += ' actual seqlen: {:5d} |'.format(args.seq_length)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
         if args.log_throughput:
+            log_string += f' samples per second: {samples_per_second:.3f} |'
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             if args.log_timers_to_tensorboard:
                 if writer:
@@ -1057,7 +1096,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         with one_logger.get_context_manager():
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
+    setup_profiler(args.profile_type,
+                   args.profile_ranks,
+                   args.profile_step_start,
+                   args.profile_step_end,
+                   args.tensorboard_dir)
+
     while iteration < args.train_iters:
+        trigger(on_step_begin)
         if args.profile and \
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
@@ -1219,6 +1265,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             exit = True
             break
 
+        # Exiting based on kill-switch
+        if found_kill_switch(args):
+            if args.save and not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         opt_param_scheduler,
+                                         num_floating_point_operations_so_far)
+            torch.distributed.barrier()
+            print_datetime(f"Detected kill switch at {args.kill_switch_path}, "
+                           f"iteration={iteration}. Exiting")
+            exit = True
+            break
+
         if args.profile and \
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
@@ -1227,6 +1285,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.manual_gc:
             if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
                 gc.collect()
+        trigger(on_step_end)
 
     one_logger_utils.track_e2e_metrics()
 
@@ -1313,11 +1372,9 @@ def evaluate(forward_step_func,
                             total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).cuda()
                         val = loss_dict[key]
                         if isinstance(val, tuple) or isinstance(val, list):
-                            total_loss_dict[key][0] += val[0]
-                            total_loss_dict[key][1] += val[1]
+                            total_loss_dict[key] += torch.tensor([val[0], val[1]], dtype=torch.float).cuda()
                         else:
-                            total_loss_dict[key][0] += val
-                            total_loss_dict[key][1] += 1
+                            total_loss_dict[key] += torch.tensor([val[0], 1], dtype=torch.float).cuda()
 
             args.consumed_valid_samples += eval_batch_size
 
@@ -1390,11 +1447,16 @@ def evaluate_and_print_results(prefix, forward_step_func,
             writer.add_scalar('{} validation vs samples'.format(key),
                               total_loss_dict[key].item(),
                               args.consumed_train_samples)
+            writer.add_scalar('{} validation vs tokens'.format(key),
+                              total_loss_dict[key].item(),
+                              args.consumed_train_samples * args.seq_length)
             if args.log_validation_ppl_to_tensorboard:
                 writer.add_scalar('{} validation ppl'.format(key), ppl,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),
                                   ppl, args.consumed_train_samples)
+                writer.add_scalar('{} validation ppl vs tokens'.format(key), ppl,
+                                  args.consumed_train_samples * args.seq_length)
             if wandb_writer and is_last_rank():
                 wandb_writer.log({
                     '{} validation'.format(key): total_loss_dict[key].item()},

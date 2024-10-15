@@ -1,9 +1,11 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron tokenizers."""
 
 from abc import ABC, abstractmethod
 import base64
+from collections import OrderedDict
 import json
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -76,6 +78,10 @@ def build_tokenizer(args):
                                   'implemented.'.format(args.tokenizer_type))
 
     # Add vocab size (if not already set from a checkpoint).
+    if getattr(args, "vocab_size", None) is None:
+        args.vocab_size = tokenizer.vocab_size
+
+    # Add padded vocab size (if not already set from a checkpoint).
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
                                                           args)
@@ -566,6 +572,15 @@ def create_llama3_tokenizer(*args, **kwargs):
 
     class _Llama3Tokenizer(Llama3Tokenizer):
         def __init__(self, *args, **kwargs):
+
+            self.unique_identifiers = OrderedDict()
+            self.unique_identifiers["class"] = type(self).__name__
+            self.unique_identifiers["tokenizer_path"] = args if len(args) > 0 else ["n/a"]
+            for option in kwargs:
+                self.unique_identifiers[option] = str(kwargs[option])
+
+            self.unique_description = json.dumps(self.unique_identifiers, indent=4)
+
             super().__init__(*args, **kwargs)
 
         def instruct_tokenize(self, s: str, bos=True, eos=False):

@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
@@ -6,6 +7,7 @@ import hashlib
 import logging
 import math
 import operator
+import os
 import queue
 import socket
 import sys
@@ -1240,3 +1242,14 @@ class StragglerDetector:
 __straggler__ = StragglerDetector()
 """StragglerDetector: private module variable, not be directly accessed
 """
+
+
+def is_real_cuda_device_available():
+    return hasattr(torch._C, "_cuda_getDeviceCount")
+
+
+def found_kill_switch(args):
+    if args.kill_switch_file is not None and os.path.exists(args.kill_switch_file):
+        return True
+    else:
+        return False

@@ -1,0 +1,6 @@
+flask-restful
+pytest
+pytest-cov
+pytest_mock
+scipy
+wrapt

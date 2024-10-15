@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Input/output checkpointing."""
@@ -23,6 +24,7 @@ from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_r
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
+from tools.checkpoint import verify_checkpoint
 
 # [ModelOpt]: Import
 try:
@@ -385,6 +387,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # And update the latest iteration
     if not torch.distributed.is_initialized() \
        or torch.distributed.get_rank() == 0:
+        if args.verify_checkpoint:
+            ckpt_folder = os.path.join(args.save, f"iter_{iteration:07d}")
+            ckpt_ok = verify_checkpoint(ckpt_folder,
+                                        args.verify_checkpoint_model_type,
+                                        args)
+            if not ckpt_ok:
+                raise RuntimeError(f"verify_checkpoint failed!!! {ckpt_folder}")
+            else:
+                print_rank_0(f"successfully passed ckpt validation: {ckpt_folder}")
         tracker_filename = get_checkpoint_tracker_filename(args.save)
 
         def iter_finalize_fn():
@@ -852,7 +863,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         try:
             # Load state dict.
             if optimizer is not None:
-                optimizer.load_state_dict(state_dict['optimizer'])
+                if args.use_distributed_optimizer:
+                    tracker_filename = get_checkpoint_tracker_filename(load_dir)
+                    iteration, release = read_metadata(tracker_filename)
+                    optimizer.load_state_dict(state_dict['optimizer'], iteration)
+                else:
+                    optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above

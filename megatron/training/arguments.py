@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
@@ -19,6 +20,7 @@ from megatron.core.models.retro.utils import (
 )
 from megatron.core.transformer import TransformerConfig
 from megatron.training.activations import squared_relu
+from megatron.core.utils import is_real_cuda_device_available
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -66,6 +68,20 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
             "Yaml config is not supported with legacy models."
         args = load_yaml(args.yaml_cfg)
 
+    OMPI_VARIABLES_MAPPING = {
+        "OMPI_COMM_WORLD_LOCAL_RANK": "LOCAL_RANK",
+        "OMPI_COMM_WORLD_SIZE": "WORLD_SIZE",
+        "OMPI_COMM_WORLD_RANK": "RANK",
+    }
+    # If any environment variable(above dict values) is set. We will not override
+    if not any(key in os.environ.keys() for key in OMPI_VARIABLES_MAPPING.values()):
+        # If all environment variables(above dict keys) is set. We will override
+        if all(key in os.environ.keys() for key in OMPI_VARIABLES_MAPPING.keys()):
+            if os.getenv("OMPI_COMM_WORLD_RANK") == "0":
+                print("setup distributed variables from mpi")
+            for mpi_env_var_name in OMPI_VARIABLES_MAPPING.keys():
+                env_var_name = OMPI_VARIABLES_MAPPING[mpi_env_var_name]
+                os.environ[env_var_name] = os.environ[mpi_env_var_name]
 
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
@@ -473,7 +489,8 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
-    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+    cuda_available = is_real_cuda_device_available()
+    if cuda_available and os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
             raise RuntimeError(
                 "Using sequence parallelism requires setting the environment variable "
@@ -553,7 +570,7 @@ def validate_args(args, defaults={}):
             "context_parallel and expert_model_parallel can't be used with tp-pp-dp mapping."
 
     # Deterministic mode
-    if args.deterministic_mode:
+    if args.deterministic_mode and cuda_available:
         assert not args.use_flash_attn, 'Flash attention can not be used in deterministic mode.'
 
         all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
@@ -577,6 +594,20 @@ def validate_args(args, defaults={}):
         print('Warning: With non-parallel ckpt save and DistributedOptimizer,'
               ' it will be impossible to resume training with different parallelism.'
               ' Consider removing flag --no-ckpt-fully-parallel-save.')
+
+    if cuda_available:
+        if args.optimizer == "fusedadamw":
+            args.optimizer = "adam"
+        args.use_fused_rmsnorm = False
+        args.use_fused_sdpa = False
+        args.use_fused_sdpa_with_recompute = False
+        args.use_fast_softmax = False
+        args.use_fused_rmsnorm = False
+    else:
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        args.gradient_accumulation_fusion = False
+        args.masked_softmax_fusion = False
+        args.no_persist_layer_norm = True
 
     # Print arguments.
     _print_args("arguments", args)
@@ -796,6 +827,10 @@ def _add_network_size_args(parser):
     group.add_argument('--normalization', default='LayerNorm',
                        choices=['LayerNorm', 'RMSNorm'],
                        help='Which normalization technique to use.')
+    group.add_argument('--use-fused-rmsnorm',
+                        type=lambda x: x.lower() in ['true', '1'],
+                        default=True,
+                        help='Enable FusedRMSNorm when rmsnorm normalization is used.')
     group.add_argument('--norm-epsilon', type=float, default=1e-5,
                        help='Epsilon for layer norm and RMS norm.')
     group.add_argument('--apply-layernorm-1p', action='store_true',
@@ -1044,6 +1079,9 @@ def _add_training_args(parser):
                        '-o <path/to/output_file> --force-overwrite true '
                        '--capture-range=cudaProfilerApi '
                        '--capture-range-end=stop`.')
+    group.add_argument("--profile-type", type=str, default=None,
+                       choices=['pt', 'pt-full', 'hltv'],
+                       help="Enable profiling, pt-full gives call stack compared to pt")
     group.add_argument('--profile-step-start', type=int, default=10,
                        help='Global step to start profiling.')
     group.add_argument('--profile-step-end', type=int, default=12,
@@ -1137,14 +1175,25 @@ def _add_training_args(parser):
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
+    group.add_argument('--use-fused-sdpa',
+                        type=lambda x: x.lower() in ['true', '1'],
+                        default=True,
+                        help='Enable Fused Scaled Dot Product Attention.')
+    group.add_argument('--use-fused-sdpa-with-recompute',
+                        type=lambda x: x.lower() in ['true', '1'],
+                        default=False,
+                        help='Enable Fused Scaled Dot Product Attention with recompute.')
+    group.add_argument('--use-fast-softmax', default=False,
+                        type=lambda x: x.lower() in ['true', '1'],
+                        help='Enable fast softmax in Fused Scaled Dot Product Attention')
     group.add_argument('--disable-bias-linear', action='store_false',
                        help='Disable bias in the linear layers',
                        dest='add_bias_linear')
     group.add_argument('--add-qkv-bias', action='store_true',
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
-    group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+    group.add_argument('--optimizer', type=str, default='fusedadamw',
+                       choices=['adam', 'sgd', 'fusedadamw'],
                        help='Optimizer function')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
@@ -1194,6 +1243,9 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help='Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
+    group.add_argument('--kill-switch-file', type=str, default=None,
+                        help='Path to look for a kill switch. '
+                             'If found will automatically exit the program.')
 
     return parser
 
@@ -1348,6 +1400,11 @@ def _add_checkpointing_args(parser):
                             ' Check StrictHandling docs for flags meaning.'
                             ' NOTE: This flag controls only distributed checkpoint'
                             ' load from storage, not loading state dict into the model.')
+    group.add_argument('--verify-checkpoint', action='store_true',
+                       help='Run verification on saved checkpoint.')
+    group.add_argument("--verify-checkpoint-model-type", default='LLAMA', type=str,
+                       help='Model family type, used for checkpoint verification only.',
+                       choices=['LLAMA'])
     return parser
 
 

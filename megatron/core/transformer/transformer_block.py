@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import re
@@ -14,6 +15,8 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.rmsnorm import RMSNorm
+
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -102,9 +105,12 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config)
+            if config.normalization not in ('LayerNorm', 'RMSNorm'):
+                raise Exception(f'Only LayerNorm and RMSNorm are currently supported, configured {config.normalization}')
+            layer_norm = LayerNormImpl if config.normalization == "LayerNorm" else RMSNorm
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers,
-                layer_norm=LayerNormImpl,
+                layer_norm=layer_norm,
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
