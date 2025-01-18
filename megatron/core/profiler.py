@@ -28,6 +28,7 @@ def setup_profiler(profile_type,
                    profile_ranks,
                    profile_step_start,
                    profile_step_end,
+                   log_memrory_to_tensorboard,
                    tensorboard_dir):
     if profile_type is None or not torch.distributed.get_rank() in profile_ranks:
         return
@@ -92,3 +93,18 @@ def setup_profiler(profile_type,
 
         on_step_begin.append(when(is_start_step, on_start_step))
         on_step_end.append(when(is_end_step, on_end_step))
+
+    elif log_memrory_to_tensorboard:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        activities.extend([torch.profiler.ProfilerActivity.HPU] if not cuda_available else [])
+        activities.extend([torch.profiler.ProfilerActivity.CUDA] if cuda_available else [])
+
+        profiler = torch.profiler.profile(
+            activities=activities,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(tensorboard_dir, use_gzip=True),
+            profile_memory=True,
+            with_stack=True)
+
+        on_step_begin.append(when(is_start_step, profiler.start))
+        on_step_end.append(when(is_capture_step, profiler.step))
+        on_step_end.append(when(is_end_step, profiler.stop))
