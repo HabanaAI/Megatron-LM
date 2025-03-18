@@ -74,6 +74,78 @@ export PYTHONPATH=$MEGATRON_LM_ROOT:$PYTHONPATH
   echo 'root hard nofile  unlimited' >> /etc/security/limits.conf
   ```
 
+## Dataset Preparation
+Follow the instructions in https://github.com/bigscience-workshop/bigscience/tree/master/data/oscar to download oscar-en full dataset. Note that the dataset takes around 550G of disk space. This dataset is used for training LLaMA & LLaMA 2.
+### Dataset Preparation Example
+The below provides the steps required to prepare your dataset. It is based on instructions in https://github.com/bigscience-workshop/bigscience/tree/master/data/oscar.  The dataset in the example is intended to be `zh`
+### Step 0 :
+```bash
+git clone https://github.com/bigscience-workshop/bigscience.git
+cd bigscience/data/oscar
+# Edit the `oscar-to-jsonl.py` in the list language_subsets and remove the comment on unshuffled_deduplicated_zh and comment out unshuffled_deduplicated_en
+vi oscar-to-jsonl.py
+```
+### Step 1 :
+```bash
+# -s can be added for subset of data
+$PYTHON oscar-to-jsonl.py
+```
+### Step 2 :
+  ```bash
+mkdir -p zh
+mv oscar*.jsonl zh
+cd zh
+  ```
+### Step 3 :
+Use one of the three methods below to tokenize the dataset. You can use any number of workers based on the CPU cores.
+*  Tokenize the dataset using GPT2BPETokenizer:
+    ```bash
+    # download gpt2 vocab and merge files
+    wget https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json
+    wget https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt
+    # tokenize individual jsonl files
+    # loop count will change based on number of files for a given dataset
+    mkdir zh_tokenized
+    for i in $(seq 0 4);
+    do
+      $PYTHON $MEGATRON_DEEPSPEED_ROOT/tools/preprocess_data.py --input oscar-${i}.jsonl --output-prefix zh_tokenized/tokenized${i} --tokenizer-type GPT2BPETokenizer --vocab-file gpt2-vocab.json --merge-file gpt2-merges.txt --append-eod --workers 80
+    done
+    ```
+  * Tokenize the dataset using GPTSentencePieceTokenizer:
+    ```bash
+    # download tokenizer.model based on model trying to train
+    # tokenize individual jsonl files
+    # loop count will change based on number of files for a given dataset
+    mkdir zh_tokenized
+    for i in $(seq 0 4);
+    do
+      $PYTHON $MEGATRON_DEEPSPEED_ROOT/tools/preprocess_data.py --input oscar-${i}.jsonl --output-prefix zh_tokenized/tokenized${i} --tokenizer-type GPTSentencePieceTokenizer --tokenizer-model /path/to/tokenizer.model --append-eod --workers 80
+    done
+    ```
+  * Tokenize the dataset using HFTokenizer:
+    ```bash
+    # path to tokenizer can be local directory path and to run custom code from it, trust remote code option(--trust-remote-code) should be passed
+    #  or
+    # path to tokenizer can be link to huggingface repo model card
+    # if huggingface repo model card is a gated repo, Log in using a token from huggingface.co/settings/tokens with below command
+    # huggingface-cli login
+    # --seq-length value need to be passed explicitly from huggingface repo model card or local directory path which has model_max_length in tokenizer_config.json file
+    # tokenize individual jsonl files
+    # loop count will change based on number of files for a given dataset
+    mkdir zh_tokenized
+    for i in $(seq 0 4);
+    do
+      $PYTHON $MEGATRON_DEEPSPEED_ROOT/tools/preprocess_data.py --input oscar-${i}.jsonl --output-prefix zh_tokenized/tokenized${i} --tokenizer-type HuggingFaceTokenizer --tokenizer-model /path/to/tokenizer --append-eod --workers 4 --seq-length 1000000000000000019884624838656
+    done
+    ```
+### Step 4 :
+ * Multiple tokenized dataset files are merged into a single file using the below method:
+    ```bash
+    # merge tokenized files
+    mkdir zh_tokenized_merged
+    $PYTHON $MEGATRON_DEEPSPEED_ROOT/tools/merge_datasets.py --input zh_tokenized --output-prefix zh_tokenized_merged/tokenized_text_document
+    # use the tokenized files generated from above command to train
+    ```
 
 # Supported Configurations
 | Model                                       | Mode        | Intel Gaudi software Version | PyTorch Version | Validated on Gaudi 2 | Validated on Gaudi 3 |
