@@ -25,6 +25,8 @@ CHECKPOINT_SAVE=${HL_SAVE:-1}
 SAVE_INTERVAL=${HL_SAVE_INTERVAL:-2000}
 CKPT_FORMAT=${HL_CKPT_FORMAT:-torch} # torch, torch_dist and zarr
 USE_DISTRIBUTED_OPTIMIZER=${HL_USE_DISTRIBUTED_OPTIMIZER:-1}
+SAVE_DISTRIB_OPTIMIZER_METHOD=${HL_SAVE_DISTRIB_OPTIMIZER_METHOD:-serial_per_node}
+LOAD_DISTRIB_OPTIMIZER_METHOD=${HL_LOAD_DISTRIB_OPTIMIZER_METHOD:-serial_per_dp_groups}
 LOAD_DIR=${HL_LOAD_DIR:-}
 CHECKPOINTS_DIR=${HL_CHECKPOINTS_DIR:-}
 VERIFY_CKPT=${HL_VERIFY_CKPT:-1}
@@ -413,6 +415,13 @@ fi
 
 if [[ "${USE_DISTRIBUTED_OPTIMIZER}" -eq 1 ]]; then
     CMD="${CMD} --use-distributed-optimizer"
+
+    if [ -n "$SAVE_DISTRIB_OPTIMIZER_METHOD" ]; then
+        CMD="${CMD} --save-distrib-optimizer-method ${SAVE_DISTRIB_OPTIMIZER_METHOD}"
+    fi
+    if [ -n "$LOAD_DISTRIB_OPTIMIZER_METHOD" ]; then
+        CMD="${CMD} --load-distrib-optimizer-method ${LOAD_DISTRIB_OPTIMIZER_METHOD}"
+    fi
 fi
 
 if [[ "${DETERMINISTIC_MODE}" -eq 1 ]]; then

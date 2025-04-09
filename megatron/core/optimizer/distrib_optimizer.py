@@ -36,8 +36,14 @@ from ..dist_checkpointing.mapping import (
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from ..parallel_state import get_all_data_parallel_ranks
 from ..transformer.module import MegatronModule
-from ..utils import is_float8tensor, is_real_cuda_device_available, print_rank_0
+from ..utils import (
+    get_node_data_parallel_ranks,
+    is_float8tensor,
+    is_real_cuda_device_available,
+    print_rank_0,
+)
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
@@ -813,7 +819,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state[gbuf_idx] = dtype_state
         return state
 
-    def get_parameter_state_dp_zero(self, params=('param', 'exp_avg', 'exp_avg_sq')):
+    def get_parameter_state_dp_zero(self, gather_data_parallel_rank=0):
         """Get parameter state (i.e., parameter & optimizer tensors).
 
         This method performs two steps:
@@ -843,12 +849,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                 # Create coalesced tensors for all state related to parameters in this buffer.
                 world_tensors = {}
-                if data_parallel_rank == 0:
+                if data_parallel_rank == gather_data_parallel_rank:
                     world_tensors = {
                         key: torch.zeros(
                             (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
                         )
-                        for key in params
+                        for key in ('param', 'exp_avg', 'exp_avg_sq')
                     }
                     world_tensors["numel_unpadded"] = buffer_numel_unpadded
                 offset_in_world_tensors = 0
@@ -866,7 +872,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     local_shards = {
                         key: torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
-                        for key in params
+                        for key in ('param', 'exp_avg', 'exp_avg_sq')
                     }
 
                     # Build contiguous DP rank shards (for param + optim states).
@@ -889,9 +895,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     # Gather contiguous shards on DP rank 0.
                     for key, send_tensor in local_shards.items():
-
                         # Gather tensor list.
-                        if data_parallel_rank == 0:
+                        if data_parallel_rank == gather_data_parallel_rank:
                             recv_tensors = [
                                 torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
                                 for _ in range(data_parallel_world_size)
@@ -903,12 +908,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         torch.distributed.gather(
                             send_tensor,
                             recv_tensors,
-                            data_parallel_global_ranks[0],
+                            data_parallel_global_ranks[gather_data_parallel_rank],
                             data_parallel_group_gloo,
                         )
 
                         # Concatenate.
-                        if data_parallel_rank == 0:
+                        if data_parallel_rank == gather_data_parallel_rank:
                             recv_tensors_concatenated = torch.cat(recv_tensors)
                             # Copy this bucket's collected all-gather tensors into the right place
                             # in the tensor for the buffer. The tensor for the buffer gets rid of
@@ -938,43 +943,69 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if torch.distributed.get_rank(self.data_parallel_group) == 0:
             torch.save(state_dict, filename)
 
-    def save_parameter_state_by_dp_groups(self, filename: str):
+    def save_parameter_state_by_dp_groups(
+        self, filename: str, save_distrib_optimizer_method: str = 'serial_per_node'
+    ):
         """Save the distributed parameter states of all optimizers to a file.
-        The optimizer state saving is performed sequentially for data parallel
-        groups, effectively decreasing peak memory usage.
+        Depending on a chosen method, export of the optimizer states is performed:
+        parallel per nodes, sequentially per nodes or sequentially per
+        data parallel groups. Each of the selected methods has a different
+        degree of decreasing memory usage in relation to performance.
 
         Args:
             filename (str): path to save parameter state to.
+            save_distrib_optimizer_method (str): method for exporting distributed
+                optimizer states, balancing memory savings and performance.
         """
+
+        assert save_distrib_optimizer_method != 'parallel_node_0'
 
         data_parallel_global_ranks = torch.distributed.get_process_group_ranks(
             self.data_parallel_group_gloo
         )
         data_parallel_rank = torch.distributed.get_rank(self.data_parallel_group_gloo)
-        world_size = torch.distributed.get_world_size()
-        world_ranks = list(range(world_size))
+        world_rank = torch.distributed.get_rank()
+
+        node_data_parallel_global_ranks, node_ranks = get_node_data_parallel_ranks(
+            data_parallel_global_ranks
+        )
+
+        if save_distrib_optimizer_method == 'serial_per_dp_groups':
+            serial_data_parallel_ranks = get_all_data_parallel_ranks()
+        else:
+            serial_data_parallel_ranks = node_data_parallel_global_ranks
 
         torch.distributed.barrier()
-        for global_rank in range(world_size):
-            if global_rank in data_parallel_global_ranks and global_rank in world_ranks:
-                print_rank_0(
-                    f'Started exporting distributed optimizer states for a data parallel group with `{data_parallel_global_ranks}` global ranks.'
+        for dp_ranks in serial_data_parallel_ranks:
+            if world_rank in dp_ranks:
+                # Get gather data parallel rank (group rank assosiated with the node).
+                gather_data_parallel_rank = next(
+                    (i for i, dp_rank in enumerate(dp_ranks) if dp_rank in node_ranks), None
                 )
-                state_dict = self.get_parameter_state_dp_zero()
-                if data_parallel_rank == 0:
+                assert gather_data_parallel_rank is not None
+
+                print_rank_0(
+                    f'Started exporting distributed optimizer states for a data parallel group with `{data_parallel_global_ranks}` global ranks.',
+                    self.data_parallel_group,
+                )
+                state_dict = self.get_parameter_state_dp_zero(gather_data_parallel_rank)
+                if data_parallel_rank == gather_data_parallel_rank:
                     torch.save(state_dict, filename)
                     state_dict.clear()
-                    del state_dict
-                    gc.collect()
-                    print_rank_0(
+                    print(
                         f'Distributed optimizer states has been saved for a data parallel group with `{data_parallel_global_ranks}` global ranks.'
                     )
-                # From the world ranks remove ranks that have already exported optimizer states.
-                world_ranks = list(set(world_ranks) - set(data_parallel_global_ranks))
+                del state_dict
+                gc.collect()
 
-            torch.distributed.barrier()
+            # All data parallel groups work in parallel
+            if not save_distrib_optimizer_method == 'parallel_multi_node':
+                torch.distributed.barrier()
 
-        print_rank_0(f'Successfuly exported distributed optimizer states!')
+        torch.distributed.barrier()
+        print_rank_0(
+            f'Successfuly exported distributed optimizer states!', self.data_parallel_group
+        )
 
     def sharded_state_dict(
         self,
@@ -1455,7 +1486,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 recv_tensor[gbuf_local_start:gbuf_local_end]
                             )
 
-    def load_parameter_state_from_dp_zero(self, state_dict, *, update_legacy_format=False):
+    def load_parameter_state_from_dp_zero(
+        self, state_dict, *, update_legacy_format=False, scatter_data_parallel_rank=0
+    ):
         """Load parameter state (i.e., parameter & optimizer tensors) from DP 0 rank,
         using the new checkpoint format with coalesced state across buckets.
 
@@ -1480,14 +1513,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.data_parallel_group_gloo
         )
 
-        if data_parallel_rank == 0:
+        if data_parallel_rank == scatter_data_parallel_rank:
             # Do nothing if "--fp8-param-gather" is not used.
             self.split_state_dict_if_needed(state_dict)
 
         # Scatter tensors to all DP ranks.
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
-                if data_parallel_rank == 0:
+                if data_parallel_rank == scatter_data_parallel_rank:
                     buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                     checkpoint_numel_unpadded = state_dict[gbuf_idx][dtype]["numel_unpadded"]
                     assert buffer_numel_unpadded == checkpoint_numel_unpadded, (
@@ -1514,7 +1547,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
 
                         # Scatter tensor list.
-                        if data_parallel_rank == 0:
+                        if data_parallel_rank == scatter_data_parallel_rank:
                             world_tensors = state_dict[gbuf_idx][dtype][key]
 
                             start = offset_in_world_tensors
@@ -1540,7 +1573,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         torch.distributed.scatter(
                             recv_tensor,
                             send_tensors,
-                            data_parallel_global_ranks[0],
+                            data_parallel_global_ranks[scatter_data_parallel_rank],
                             data_parallel_group_gloo,
                         )
 
@@ -1711,6 +1744,84 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.load_parameter_state_from_dp_zero(
             state_dict, update_legacy_format=update_legacy_format
         )
+
+    def load_parameter_state_by_dp_groups(
+        self,
+        filename: str,
+        *,
+        update_legacy_format=False,
+        load_distrib_optimizer_method: str = 'serial_per_dp_groups',
+    ):
+        """Load the distributed parameter states from disk.
+        Depending on a chosen method, the optimizer states loading is performed:
+        parallel per nodes, sequentially per nodes or sequentially per
+        data parallel groups. Each of the selected methods has a different
+        degree of decreasing memory usage in relation to performance.
+
+        Args:
+            filename (str): path to save parameter state to.
+            update_legacy_format (bool): whether to update a legacy format.
+            save_distrib_optimizer_method (str): method for exporting distributed
+                optimizer states, balancing memory savings and performance.
+        """
+
+        assert load_distrib_optimizer_method != 'parallel_node_0'
+
+        data_parallel_global_ranks = torch.distributed.get_process_group_ranks(
+            self.data_parallel_group_gloo
+        )
+        data_parallel_rank = torch.distributed.get_rank(self.data_parallel_group_gloo)
+        world_rank = torch.distributed.get_rank()
+
+        node_data_parallel_global_ranks, node_ranks = get_node_data_parallel_ranks(
+            data_parallel_global_ranks
+        )
+
+        if load_distrib_optimizer_method == 'serial_per_dp_groups':
+            serial_data_parallel_ranks = get_all_data_parallel_ranks()
+        else:
+            serial_data_parallel_ranks = node_data_parallel_global_ranks
+
+        torch.distributed.barrier()
+        # Run sequentially data parallel groups that will scatter on the same node.
+        for dp_ranks in serial_data_parallel_ranks:
+            if world_rank in dp_ranks:
+                # Get scatter data parallel rank (group rank assosiated with the node).
+                scatter_data_parallel_rank = next(
+                    (i for i, dp_rank in enumerate(dp_ranks) if dp_rank in node_ranks), None
+                )
+                assert scatter_data_parallel_rank is not None
+
+                print_rank_0(
+                    f'Started loading distributed optimizer states for a data parallel group with `{data_parallel_global_ranks}` global ranks.',
+                    self.data_parallel_group,
+                )
+
+                state_dict = None
+                if data_parallel_rank == scatter_data_parallel_rank:
+                    state_dict = torch.load(filename, weights_only=False)
+
+                self.load_parameter_state_from_dp_zero(
+                    state_dict,
+                    update_legacy_format=update_legacy_format,
+                    scatter_data_parallel_rank=scatter_data_parallel_rank,
+                )
+
+                if data_parallel_rank == scatter_data_parallel_rank:
+                    state_dict.clear()
+
+                    print(
+                        f'Distributed optimizer states has been loaded for a data parallel group with `{data_parallel_global_ranks}` global ranks.'
+                    )
+                del state_dict
+                gc.collect()
+
+            # All data parallel groups work in parallel
+            if not load_distrib_optimizer_method == 'parallel_multi_node':
+                torch.distributed.barrier()
+
+        torch.distributed.barrier()
+        print_rank_0(f'Successfuly loaded distributed optimizer states!', self.data_parallel_group)
 
     def zero_grad(self, set_to_none: bool = True):
         """

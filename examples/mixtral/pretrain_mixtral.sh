@@ -43,6 +43,7 @@ DROPOUT=${HL_DROPOUT:-0.0}
 LR_WARMUP_ITERS=${HL_LR_WARMUP_ITERS:-2000}
 USE_CPU_INIT=${HL_USE_CPU_INIT:-0}
 
+# General MoE Arguments
 MOE_EXPERT_CAPACITY_FACTOR=${HL_MOE_EXPERT_CAPACITY_FACTOR:-}
 MOE_TOKEN_DROP_POLICY=${HL_MOE_TOKEN_DROP_POLICY:-probs}  # either probs or position
 MOE_PAD_EXPERT_INPUT_TO_CAPACITY=${HL_MOE_PAD_EXPERT_INPUT_TO_CAPACITY:-0}
@@ -53,11 +54,14 @@ MOE_TOKEN_DISTRIBUTION_LOGGING=${HL_MOE_TOKEN_DISTRIBUTION_LOGGING:-0}
 MOE_TOKEN_DISTRIBUTION_LOGGING_INTERVAL=${HL_MOE_TOKEN_DISTRIBUTION_LOGGING_INTERVAL:-50}
 MOE_ROUTER_PRE_SOFTMAX=${HL_MOE_ROUTER_PRE_SOFTMAX:-1}
 MOE_ROUTER_FP32=${HL_MOE_ROUTER_FP32:-1}
-MOE_DYNAMIC=${HL_MOE_DYNAMIC:-0}
+
+# Dynamic MOE with IntelDynamicMLP
+MOE_DYNAMIC=${HL_MOE_DYNAMIC:-1} # Default for HPU
 MOE_PERMUTED_WEIGHTS=${HL_MOE_PERMUTED_WEIGHTS:-1}
 MOE_FUSED_WEIGHTS=${HL_MOE_FUSED_WEIGHTS:-1}
 
-MOE_NUM_CAPACITY_BINS=${HL_MOE_NUM_CAPACITY_BINS:-10}
+# Capacity Bins with SequentialMLP
+MOE_NUM_CAPACITY_BINS=${HL_MOE_NUM_CAPACITY_BINS:-0} # 10 is default for 32k Sequence Length
 MOE_CAPACITY_BINS=${HL_MOE_CAPACITY_BINS:-}
 MOE_CAPACITY_BINS_EXP_BASE=${HL_MOE_CAPACITY_BINS_EXP_BASE:-1.5}
 MOE_CAPACITY_BINS_ALIGNMENT=${HL_MOE_CAPACITY_BINS_ALIGNMENT:-64}
@@ -94,6 +98,8 @@ TRAIN_ITERS=${HL_TRAIN_ITERS:-250000}
 EVAL_ITERS=${HL_EVAL_ITERS:-100}
 EVAL_INTERVAL=${HL_EVAL_INTERVAL:-1000}
 EXIT_INTERVAL=${HL_EXIT_INTERVAL:-0}
+SAVE_DISTRIB_OPTIMIZER_METHOD=${HL_SAVE_DISTRIB_OPTIMIZER_METHOD:-parallel_multi_node}
+LOAD_DISTRIB_OPTIMIZER_METHOD=${HL_LOAD_DISTRIB_OPTIMIZER_METHOD:-serial_per_node}
 
 PROFILE_TYPE=${HL_PROFILE_TYPE:-}  # provide either of pt, pt-full, hltv
 PROFILE_STEP_START=${HL_PROFILE_STEP_START:-3}
@@ -164,20 +170,21 @@ if [ -z "${MOE_EP}" ]; then
   fi
 fi
 
-if [[ $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
-    if [[ ! -z $MOE_EXPERT_CAPACITY_FACTOR ]]; then
-        echo "Using either Capacity Bins or Capacity Factor for MoE Expert capacity."
+if [ $MOE_DYNAMIC -eq 1 ]; then
+    if [ $MOE_NUM_CAPACITY_BINS -gt 0 ]; then
+        echo "Dynamic MoE 'IntelDynamicMLP' and Capacity Bins can't be used together. In most scenarions 'IntelDynamicMLP' will perform better."
         exit 1
     fi
+    if [ $FP8 -eq 1 ]; then
+        echo "Dynamic MoE 'IntelDynamicMLP' supports FP32 and BF16 precision, got HL_FP8=1"
+        exit 1
+    fi
+fi
+
+if [[ $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
     echo "Using either Capacity Bins. Capacity factor value will be ignored. Token padding is done by default."
     MOE_EXPERT_CAPACITY_FACTOR=""
     MOE_PAD_EXPERT_INPUT_TO_CAPACITY=1
-fi
-
-if [[ "$TOKEN_DISPATCHER_TYPE" != "alltoall" ]]; then
-    echo "Unsupported token disptacher selected. Please use 'alltoall'."
-    # TODO: SW-206636
-    exit 1
 fi
 
 if [[ "${USE_FUSED_SDPA}" = "1" || "${USE_FUSED_SDPA_WITH_RECOMPUTE}" = "1" ]]; then
@@ -373,12 +380,42 @@ fi
 
 # -------------
 # MoE arguments
+# -------------
+
+# MoE Dynamic Kernel arguments
+
+if [ $MOE_DYNAMIC -eq 1 ]; then
+    CMD="${CMD} --moe-dynamic-hpu"
+    if [ $MOE_PERMUTED_WEIGHTS -eq 1 ]; then
+        CMD="${CMD} --moe-permuted-weights"
+    fi
+    if [ $MOE_FUSED_WEIGHTS -eq 1 ]; then
+        CMD="${CMD} --moe-fused-weights"
+    fi
+    echo "While using Dynamic MoE HPU Kernel - IntelDynamicMLP capacity settings and padding are set to None!"
+    MOE_NUM_CAPACITY_BINS=0
+    MOE_PAD_EXPERT_INPUT_TO_CAPACITY=""
+    MOE_EXPERT_CAPACITY_FACTOR=""
+    MOE_TOKEN_DISPATCHER_TYPE=""
+fi
+
+# MoE Capacity Bins arguments
+
+if [[ $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
+    CMD="${CMD} --moe-capacity-bins-num ${MOE_NUM_CAPACITY_BINS}"
+    CMD="${CMD} --moe-capacity-bins-exp-base ${MOE_CAPACITY_BINS_EXP_BASE}"
+    CMD="${CMD} --moe-capacity-bins-alignment ${MOE_CAPACITY_BINS_ALIGNMENT}"
+    CMD="${CMD} --moe-capacity-bins-optimize-interval ${MOE_CAPACITY_BINS_OPTIMIZE_INTERVAL}"
+    CMD="${CMD} --moe-capacity-bins-optimize-max-group ${MOE_CAPACITY_BINS_OPTIMIZE_MAX_GROUP}"
+    CMD="${CMD} --moe-capacity-bins-max-overhead-factor ${MOE_CAPACITY_BINS_MAX_OVERHEAD_FACTOR}"
+fi
 
 CMD="${CMD} --num-experts ${MOE_NUM_EXPERTS}"
 CMD="${CMD} --moe-router-topk ${MOE_TOPK}"
 CMD="${CMD} --moe-router-load-balancing-type aux_loss"
 CMD="${CMD} --moe-aux-loss-coeff ${MOE_AUX_LOSS_COEFF}"
 CMD="${CMD} --moe-token-dispatcher-type ${TOKEN_DISPATCHER_TYPE}"
+
 if [ -n "$MOE_ZLOSS_COEFF" ]; then
     CMD="${CMD} --moe-z-loss-coeff ${MOE_ZLOSS_COEFF}"
 fi
@@ -392,19 +429,6 @@ fi
 if [ $MOE_ROUTER_FP32 -eq 1 ]; then
     CMD="${CMD} --moe-router-fp32"
 fi
-if [ $MOE_DYNAMIC -eq 1 ]; then
-    CMD="${CMD} --moe-dynamic-hpu"
-    if [ $MOE_PERMUTED_WEIGHTS -eq 1 ]; then
-        CMD="${CMD} --moe-permuted-weights"
-    fi
-    if [ $MOE_FUSED_WEIGHTS -eq 1 ]; then
-        CMD="${CMD} --moe-fused-weights"
-    fi
-    echo "While using Dynamic MoE HPU Kernel - IntelDynamicMLP capacity settings and padding are set to None!"
-    MOE_NUM_CAPACITY_BINS=0
-    MOE_PAD_EXPERT_INPUT_TO_CAPACITY=""
-    MOE_EXPERT_CAPACITY_FACTOR=""
-fi
 if [ ! -z "$MOE_EXPERT_CAPACITY_FACTOR" ]; then
     CMD="${CMD} --moe-expert-capacity-factor ${MOE_EXPERT_CAPACITY_FACTOR}"
     CMD="${CMD} --moe-token-drop-policy ${MOE_TOKEN_DROP_POLICY}"
@@ -413,24 +437,6 @@ if [ $MOE_PAD_EXPERT_INPUT_TO_CAPACITY -eq 1 ]; then
     CMD="${CMD} --moe-pad-expert-input-to-capacity"
 fi
 
-# ---------------------------
-# MoE Capacity Bins arguments
-# ---------------------------
-
-if [[ $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
-    CMD="${CMD} --moe-capacity-bins-num ${MOE_NUM_CAPACITY_BINS}"
-    CMD="${CMD} --moe-capacity-bins-exp-base ${MOE_CAPACITY_BINS_EXP_BASE}"
-    CMD="${CMD} --moe-capacity-bins-alignment ${MOE_CAPACITY_BINS_ALIGNMENT}"
-    CMD="${CMD} --moe-capacity-bins-optimize-interval ${MOE_CAPACITY_BINS_OPTIMIZE_INTERVAL}"
-    CMD="${CMD} --moe-capacity-bins-optimize-max-group ${MOE_CAPACITY_BINS_OPTIMIZE_MAX_GROUP}"
-    CMD="${CMD} --moe-capacity-bins-max-overhead-factor ${MOE_CAPACITY_BINS_MAX_OVERHEAD_FACTOR}"
-fi
-
-if [ ! -z "$MOE_CAPACITY_BINS" ]; then
-    CMD="${CMD} --moe-capacity-bins ${MOE_CAPACITY_BINS}"
-fi
-
-# -------------------
 # Additonal arguments
 
 if [ $SEQ_PARALLEL -eq 1 ]; then
@@ -453,6 +459,13 @@ fi
 
 if [ $DIST_OPTIMIZER -eq 1 ]; then
     CMD="${CMD} --use-distributed-optimizer"
+
+    if [ -n "$SAVE_DISTRIB_OPTIMIZER_METHOD" ]; then
+        CMD="${CMD} --save-distrib-optimizer-method ${SAVE_DISTRIB_OPTIMIZER_METHOD}"
+    fi
+    if [ -n "$LOAD_DISTRIB_OPTIMIZER_METHOD" ]; then
+        CMD="${CMD} --load-distrib-optimizer-method ${LOAD_DISTRIB_OPTIMIZER_METHOD}"
+    fi
 fi
 
 if [ ! -z "$KILL_SWITCH_FILE" ]; then

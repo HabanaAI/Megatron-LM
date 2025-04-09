@@ -388,10 +388,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         optim_checkpoint_name = \
             get_distributed_optimizer_checkpoint_name(checkpoint_name)
         ensure_directory_exists(optim_checkpoint_name)
-        if args.num_experts and torch.distributed.is_initialized():
-            optimizer.save_parameter_state_by_dp_groups(optim_checkpoint_name)
-        else:
+
+        if args.save_distrib_optimizer_method == 'parallel_node_0':
             optimizer.save_parameter_state(optim_checkpoint_name)
+        else:
+            optimizer.save_parameter_state_by_dp_groups(optim_checkpoint_name, args.save_distrib_optimizer_method)
 
     async_save_request = None
     if args.async_save:
@@ -1215,8 +1216,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 optim_checkpoint_name = \
                     get_distributed_optimizer_checkpoint_name(
                         model_checkpoint_name)
-                optimizer.load_parameter_state(optim_checkpoint_name,
-                                               update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
+                if args.load_distrib_optimizer_method == 'parallel_node_0':
+                    optimizer.load_parameter_state(optim_checkpoint_name,
+                                                update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
+                else:
+                    optimizer.load_parameter_state_by_dp_groups(optim_checkpoint_name,
+                                                update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,
+                                                load_distrib_optimizer_method=args.load_distrib_optimizer_method)
 
             # Load scheduler.
             if opt_param_scheduler is not None:

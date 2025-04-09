@@ -1,9 +1,13 @@
+# Copyright (C) 2025 Intel Corporation
+
+import itertools
 import os
 
 import pytest
 import torch
 
 import megatron.core.parallel_state as ps
+from megatron.core.utils import get_node_data_parallel_ranks
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
@@ -39,6 +43,7 @@ def test_initialize_and_destroy_model_parallel(order):
     assert ps.get_tensor_model_parallel_group() is not None
     assert ps.get_pipeline_model_parallel_group() is not None
     assert ps.get_data_parallel_group() is not None
+    assert ps.get_all_data_parallel_ranks() is not None
     Utils.destroy_model_parallel()
     assert ps._MODEL_PARALLEL_GROUP is None
 
@@ -201,6 +206,7 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     tp_dp_g = torch.distributed.get_process_group_ranks(
         ps.get_tensor_and_data_parallel_group(False)
     )
+    all_dp_ranks = ps.get_all_data_parallel_ranks()
 
     Utils.destroy_model_parallel()
 
@@ -226,6 +232,7 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     assert tp_dp_g == torch.distributed.get_process_group_ranks(
         ps.get_tensor_and_data_parallel_group(False)
     )
+    assert all_dp_ranks == ps.get_all_data_parallel_ranks()
 
     Utils.destroy_model_parallel()
 
@@ -245,6 +252,7 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     cp_g = torch.distributed.get_process_group_ranks(ps.get_context_parallel_group())
     amax_g = torch.distributed.get_process_group_ranks(ps.get_amax_reduction_group(False))
     mp_g = torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
+    all_dp_ranks = ps.get_all_data_parallel_ranks()
 
     Utils.destroy_model_parallel()
 
@@ -257,6 +265,7 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     assert cp_g == torch.distributed.get_process_group_ranks(ps.get_context_parallel_group())
     assert amax_g != torch.distributed.get_process_group_ranks(ps.get_amax_reduction_group(False))
     assert mp_g != torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
+    assert all_dp_ranks != ps.get_all_data_parallel_ranks()
 
     Utils.destroy_model_parallel()
 
@@ -512,3 +521,69 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     assert dp_no_ep_group_with_cp == rank_generator.get_ranks(
         "dp-cp", independent_ep=True
     ), f"{dp_no_ep_group_with_cp} != {rank_generator.get_ranks('dp-cp', independent_ep=True)}."
+
+
+@pytest.mark.parametrize('tensor_model_parallel_size', [1, 2, 4])
+@pytest.mark.parametrize('pipeline_model_parallel_size', [1, 2, 4])
+def test_get_all_data_parallel_ranks(tensor_model_parallel_size, pipeline_model_parallel_size):
+
+    if tensor_model_parallel_size * pipeline_model_parallel_size > 8:
+        pytest.skip(
+            f"Provided configuration {tensor_model_parallel_size=} and {pipeline_model_parallel_size=} is not supported for 8c. Skipping ..."
+        )
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+    )
+
+    all_data_parallel_ranks = ps.get_all_data_parallel_ranks()
+
+    assert len(all_data_parallel_ranks) == tensor_model_parallel_size * pipeline_model_parallel_size
+
+    all_data_parallel_ranks_flat = list(itertools.chain(*all_data_parallel_ranks))
+
+    assert sorted(all_data_parallel_ranks_flat) == list(range(world_size))
+
+    # Teardown.
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize('tensor_model_parallel_size', [1, 2, 4])
+@pytest.mark.parametrize('pipeline_model_parallel_size', [1, 2, 4])
+def test_get_node_data_parallel_ranks(tensor_model_parallel_size, pipeline_model_parallel_size):
+
+    if tensor_model_parallel_size * pipeline_model_parallel_size > 8:
+        pytest.skip(
+            f"Provided configuration {tensor_model_parallel_size=} and {pipeline_model_parallel_size=} is not supported for 8c. Skipping ..."
+        )
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+    )
+
+    world_size = torch.distributed.get_world_size()
+    device_count = torch.cuda.device_count()
+
+    if world_size != 8 or device_count != 8:
+        pytest.skip(
+            f"The test is designed for 8c configurations, but the world_size is {world_size} and the device_count is {device_count}. Skipping ..."
+        )
+
+    dp_g = torch.distributed.get_process_group_ranks(ps.get_data_parallel_group(False))
+
+    node_data_parallel_global_ranks, node_ranks = get_node_data_parallel_ranks(dp_g)
+
+    assert node_ranks == list(range(device_count))
+    assert (
+        len(node_data_parallel_global_ranks)
+        == tensor_model_parallel_size * pipeline_model_parallel_size
+    )
+
+    node_data_parallel_global_ranks_flat = list(itertools.chain(*node_data_parallel_global_ranks))
+
+    assert sorted(node_data_parallel_global_ranks_flat) == list(range(device_count))
+
+    # Teardown.
+    Utils.destroy_model_parallel()

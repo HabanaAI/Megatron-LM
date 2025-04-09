@@ -113,30 +113,29 @@ Refer to [training script settings](#training-script-settings) for details.
 This can be additonaly paired with Fused SDPA recompute `HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1`.
 More information on these settings can be found in the main README section.
 
+### Validated Configurations for MoE 
+* For the best performance and model accuracy, use MoE with the Fused MoE Kernel, as shown in the example below.
+* For configurations with MoE Capacity Factor or Capacity Bins, use AllToAll Token Dispatcher. The AllGather Token Dispatcher is sufficient for basic dropless mode.
+* Expert Parallel and Pipeline Parallel modes have been validated with the HPU Fused MoE Kernel and other MoE configurations.
+
+The following Mixtral 8x7B configuration has been validated as the most effective for Gaudi 2:
+4DP+8TP+SP with 8 experts top-2 and 32k sequence length and Aux Loss for load balancing.
+
+Expert Parallel and Pipeline Parallel have been validated to be functioning with HPU Fused MoE Kernel and other MoE configurations.
+
 ### Run Mixtral 8x7b on 32 HPUs, Lazy mode, with BF16 precision, sequence length 32k:
   ```
   HL_HOSTSFILE=$MEGATRON_LM_ROOT/examples/hostsfile \
-  HL_TOKEN_DISPATCHER_TYPE='alltoall' \
-  HL_DIST_OPTIMIZER=1 \
-  HL_MOE_NUM_CAPACITY_BINS=10 \
   HL_NUM_NODES=4 \
   HL_DP=4 \
   HL_TP=8 \
-  HL_MOE_EP=1 \
   HL_SEQ_PARALLEL=1 \
   HL_CKP_ACT=3 \
   HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1 \
+  HL_MOE_DYNAMIC=1 \
+  HL_DIST_OPTIMIZER=1 \
   $MEGATRON_LM_ROOT/examples/mixtral/pretrain_mixtral.sh
   ```
-
-### Validated Configurations for MoE 
-For the best performance and model accuracy please use MoE with Capacity Bins as in the example specified above.
-Any other configuration using MoE Capacity Factor with or without padding should run with AllToAll Token Dispatcher.
-
-The following configurations have been validated to be functioning with Gaudi 2. 
-* DP+TP+SP+AllToAll
-* DP+EP+AllToAll
-* Pipeline Parallel may be combined with the above configurations.
 
 # Useful Tools
 
@@ -163,7 +162,7 @@ For more information, please see [tools/checkpoint/README.md](../../tools/checkp
 # Supported Configuration
 | Validated on  | Intel Gaudi Software Version | PyTorch Version | Mode     |
 |---------------|------------------------------|-----------------|----------|
-| Gaudi 2       | 1.20.0                       | 2.6.0           | Training |
+| Gaudi 2       | 1.20.1                       | 2.6.0           | Training |
 
 # Known Issues
 * Only scripts and configurations mentioned in this README are supported and verified.

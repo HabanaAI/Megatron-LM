@@ -78,14 +78,18 @@ export PYTHONPATH=$MEGATRON_LM_ROOT:$PYTHONPATH
 # Supported Configurations
 | Model                                       | Mode        | Intel Gaudi software Version | PyTorch Version | Validated on Gaudi 2 | Validated on Gaudi 3 |
 | --------------------------------------------| ----------- | ---------------------------- | --------------- | -------------------- | -------------------- |
-| [LLaMA 3.1](examples/llama/README.md)       | Pretraining | 1.20.0                       | 2.6.0           | :heavy_check_mark:   | :heavy_check_mark:*  |
-| [Mixtral 8x7B](examples/mixtral/README.md)  | Pretraining | 1.20.0                       | 2.6.0           | :heavy_check_mark:** |                      |
+| [LLaMA 3.1](examples/llama/README.md)       | Pretraining | 1.20.1                       | 2.6.0           | :heavy_check_mark:   | :heavy_check_mark:*  |
+| [Mixtral 8x7B](examples/mixtral/README.md)  | Pretraining | 1.20.1                       | 2.6.0           | :heavy_check_mark:** |                      |
 
 *Sporadic numerical instability can occur when training with fp8 precision.
 
 **Only BF16 configurations are currently enabled.
 
 # Changelog
+## 1.20.1
+- Enabled Dynamic MoE computation on HPU with `IntelDynamicMLP` which supports bf16 and fp32 precision. Token routing inside the EP/TP group and reductions in and between groups are internalized within the fused MoE kernel, which speeds up training and improves token balancing by minimizing padding. No tokens are dropped. DP/TP/EP/PP/SP modes are supported.
+- Added different levels of memory optimization for exporting or loading distributed optimizer states, controlled via an argument.
+
 ## 1.20.0
 - Changed the default behavior of "accumulate_allreduce_grads_in_fp32" for the bfloat16 data type. Instead of performing gradient accumulation and all-reduce in fp32, it is sufficient to do so in bfloat16 for some configurations. However, for configurations where Gradient Accumulutation Steps * data parallel size > 256, switching to fp32 is necessary.
 - Rebased code to upstream [core_r0.9.0](https://github.com/NVIDIA/Megatron-LM/tree/core_r0.9.0) release.

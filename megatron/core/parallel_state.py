@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Model and data parallel groups."""
@@ -29,6 +29,7 @@ _POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 _DATA_PARALLEL_GROUP_GLOO = None
+_ALL_DATA_PARALLEL_RANKS = None
 # tensor model parallel group and data parallel group combined
 # used for fp8 and moe training
 _TENSOR_AND_DATA_PARALLEL_GROUP = None
@@ -643,17 +644,25 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_WITH_CP
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
+    global _ALL_DATA_PARALLEL_RANKS
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
+    assert _ALL_DATA_PARALLEL_RANKS is None, 'data parallel ranks are already initialized'
 
+    all_data_parallel_ranks = []
     for ranks in generator_wrapper('dp'):
         group = torch.distributed.new_group(
             ranks, timeout=timeout, pg_options=get_nccl_options('dp', nccl_comm_cfgs)
         )
         group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend="gloo")
+        all_data_parallel_ranks.append(ranks)
+
         if rank in ranks:
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
+
+    if len(all_data_parallel_ranks) != 0:
+        _ALL_DATA_PARALLEL_RANKS = all_data_parallel_ranks
 
     for ranks_with_cp in generator_wrapper('dp-cp'):
         group_with_cp = torch.distributed.new_group(
@@ -951,6 +960,12 @@ def get_data_parallel_group_gloo(with_context_parallel=False):
     else:
         assert _DATA_PARALLEL_GROUP_GLOO is not None, 'data parallel group-gloo is not initialized'
         return _DATA_PARALLEL_GROUP_GLOO
+
+
+def get_all_data_parallel_ranks():
+    """Get all data-parallel groups."""
+    assert _ALL_DATA_PARALLEL_RANKS is not None, 'there are no data parallel groups'
+    return _ALL_DATA_PARALLEL_RANKS
 
 
 def get_context_parallel_group(check_initialized=True):
@@ -1585,6 +1600,9 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _ALL_DATA_PARALLEL_RANKS
+    _ALL_DATA_PARALLEL_RANKS = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None

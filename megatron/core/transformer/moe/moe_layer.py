@@ -85,7 +85,9 @@ class MoELayer(BaseMoELayer):
             else:
                 self.experts = GroupedMLP(self.num_local_experts, self.config)
         elif self.config.moe_dynamic_hpu:
-            self.experts = IntelDynamicMLP(self.num_local_experts, self.config)
+            self.experts = IntelDynamicMLP(
+                self.num_local_experts, self.local_expert_indices, self.config
+            )
         else:
             assert isinstance(self.submodules, MLPSubmodules)
             self.experts = SequentialMLP(self.num_local_experts, self.config, self.submodules)
@@ -101,11 +103,15 @@ class MoELayer(BaseMoELayer):
             self.token_dispatcher = MoEAlltoAllSEQTokenDispatcher(
                 self.num_local_experts, self.local_expert_indices, config=self.config
             )
+        elif config.moe_token_dispatcher_type == None:
+            self.token_dispatcher = None
         else:
             raise ValueError(
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
             )
         self.moe_layer_recompute = config.moe_layer_recompute
+        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.ep_size = parallel_state.get_expert_model_parallel_world_size()
 
     def forward(self, hidden_states: torch.Tensor):
         if (
@@ -130,13 +136,41 @@ class MoELayer(BaseMoELayer):
 
         def custom_forward_hpu(hidden_states):
             probs, indices = self.router(hidden_states)
-            output, mlp_bias = self.experts(hidden_states, probs, indices)
+
+            if self.tp_size > 1 or self.ep_size > 1:
+                with torch.no_grad():
+                    global_indices = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
+                        indices
+                    )
+                global_probs = tensor_parallel.gather_from_sequence_parallel_region_to_moe(probs)
+                global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
+                    hidden_states, use_global_buffer=True
+                )
+            else:
+                global_hidden_states = hidden_states
+                global_probs = probs
+                global_indices = indices
+
+            # process tokens with expert MLPs
+            expert_output, mlp_bias = self.experts(
+                global_hidden_states, global_probs, global_indices
+            )
+
+            if self.tp_size > 1 or self.ep_size > 1:
+                output = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
+                    expert_output
+                )
+            else:
+                output = expert_output
+
+            output = output.view(hidden_states.shape)
+
             return output, mlp_bias
 
         fn = custom_forward_hpu if self.config.moe_dynamic_hpu else custom_forward
 
-        if self.moe_layer_recompute and not self.config.moe_dynamic_hpu:
-            output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+        if self.moe_layer_recompute:
+            output, mlp_bias = tensor_parallel.checkpoint(fn, False, hidden_states)
         else:
             output, mlp_bias = fn(hidden_states)
 

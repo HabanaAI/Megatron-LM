@@ -384,6 +384,8 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        cuda_available = is_real_cuda_device_available()
+
         if self.fp16 and self.bf16:
             raise ValueError(
                 f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.'
@@ -429,19 +431,6 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_router_load_balancing_type not in ["aux_loss", "none"]:
                 raise ValueError(
                     'moe_expert_capacity_factor only works with aux_loss or none load balancing'
-                )
-
-        if self.moe_pad_expert_input_to_capacity:
-            if self.moe_expert_capacity_factor is None and self.moe_capacity_bins_num == 0:
-                raise ValueError(
-                    'moe_expert_capacity_factor or moe_capacity_bins_num > 0 must be set to use moe_pad_expert_input_to_capacity'
-                )
-
-        if self.moe_capacity_bins_num != 0:
-            self.moe_pad_expert_input_to_capacity = True
-            if self.moe_expert_capacity_factor is not None:
-                raise ValueError(
-                    f'moe_expert_capacity_factor must be set to None when using moe_capacty_bins > 0'
                 )
 
         if self.cpu_offloading and (
@@ -551,8 +540,6 @@ class TransformerConfig(ModelParallelConfig):
                     f'extended_tp_size {extended_tp_size}'
                 )
 
-        cuda_available = is_real_cuda_device_available()
-
         if cuda_available and self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
             if not is_te_min_version("1.7.0.dev0"):
@@ -563,23 +550,6 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.moe_grouped_gemm:
                 raise ValueError("Grouped GEMM of MoE not support fp8 for now.")
-
-        if self.moe_dynamic_hpu:
-            assert (
-                not cuda_available
-            ), "moe_dynamic_hpu can be used only with HPU-specific Dynamic MoE kernels."
-            error_msg = ""
-            if self.moe_capacity_bins_num != 0:
-                error_msg += f"moe_capacity_bins_num={self.moe_capacity_bins_num} -> set it to 0. "
-            if self.moe_pad_expert_input_to_capacity:
-                error_msg += f"self.moe_pad_expert_input_to_capacity={self.moe_pad_expert_input_to_capacity} -> set it to False. "
-            if self.moe_expert_capacity_factor:
-                error_msg += f"self.moe_expert_capacity_factor={self.moe_expert_capacity_factor} -> set it to None."
-
-            if error_msg:
-                raise ValueError(
-                    f"MoE implementation IntelDynamicMLP can only be used with basic dropless token disptacher config, got invalid config: {error_msg}"
-                )
 
 
 _APPLY_CAG_DTYPE_CAST_WA = False

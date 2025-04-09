@@ -1,9 +1,11 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, tensor_parallel

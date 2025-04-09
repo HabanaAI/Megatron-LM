@@ -21,6 +21,11 @@ Megatron-Core offers rich parallelism mappings, combining expert parallelism wit
     - Aux loss / Load balancing loss
 
 ### Performance Optimizations
+- Fused MoE Kernel
+    - Supported dtypes: bf16, fp32
+    - Supported only on HPU
+    - Performance improvement and faster load balancing
+    - Enable `--moe-dynamic-hpu`
 - GroupedGEMM when num local experts > 1
     - Supported dtype: bf16
     - Performance improvements for larger MoE models
@@ -30,7 +35,7 @@ Megatron-Core offers rich parallelism mappings, combining expert parallelism wit
 
 - Dropless / No token drop
 - Token drop and padding
-- Capacity bins (no drop with optimized padding)
+- Capacity bins (no drop with optimized discrete padding)
 
 ### Ease of use
 - Checkpoint converter for Mixtral models, see the [example](https://github.com/HabanaAI/Megatron-LM/tree/main/examples/mixtral) for details.
@@ -69,6 +74,16 @@ Megatron-Core offers rich parallelism mappings, combining expert parallelism wit
 | --moe-router-fp32 | Explicit casting of the router input to fp32 may be used to improve model accuracy and softmax numerical stablility. |
 | --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
 
+### Fused HPU MoE Kernel
+
+Fused Dynamic MoE Kernel encapsulates expert MLP computation and token scatter-gather operations in and between EP/TP groups into a single operation executed fully on HPU. It ensures precision without compromising performance due to excessive input token padding while maintaining the compiled HPU graph integrity - even with dynamic input shapes. This feature is enabled with a new MoE Module `IntelDynamicMLP` and is integrated to be used with a standard `MoELayer` formulation. The kernel supports BF16 and FP32 precision.
+
+| Item | Description |
+| --- | --- |
+| moe-dynamic-hpu | Enable fused dynamic kernel. Default is True. |
+| moe-permuted-weights | FFN weight format for inference frameworks compliance. Default is True. |
+| moe-fused-weights | SwiGLU packed weight format. Default is True. |
+
 ### Capacity Bins - performance optimization in dropless scenario
 
 In addition, Capacity Bins functionality is enabled for Mixtral.
@@ -89,6 +104,7 @@ with the `AllToAll` token dispatcher.
 | moe-capacity-bins-oprimize-max-group | Maximum group size of adjacent MoE gates that their capacity bins are optimized jointly. Default is 4. |
 | moe-capacity-bins-max-overhead-factor | Value of capacity bins overhead that will trigger bins optimization. Overhead is defined as relative additional capacity used with bins, compared to requested capacity value. Default is 0.0. |
 
+
 ## Usage
 
 ### Quick Start
@@ -96,12 +112,8 @@ To train a top-2 MoE model with 8 experts and auxiliary loss, include the follow
 
 ```bash
 --num-experts 8
---expert-model-parallel-size 8
---moe-grouped-gemm
 --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, none. Default is aux_loss.
 --moe-router-topk 2
---moe-aux-loss-coeff 1e-2
---use-distributed-optimizer
 --moe-token-dispatcher-type alltoall
 ```
 
@@ -114,9 +126,18 @@ To enable the token drop mechanism, such as GShard and SwitchTransformer, includ
 
 Instead of a fixed uniform capacity, use a discrete set of capacity values that will be asinged automatically to each expert per layer, minimizing redundant padding:
 
-```python
+```bash
 --moe-capacity-bins-num 10
 --moe-pad-expert-input-to-capacity # Required
+```
+
+To run the model on Gaudi, enable fused kernel for the best performance:
+
+```bash
+--num-experts 8
+--moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, none. Default is aux_loss.
+--moe-router-topk 2
+--moe-dynamic-hpu
 ```
 
 The following figure illustrates different dropping strategies in MCore:
@@ -132,6 +153,7 @@ The following figure illustrates different dropping strategies in MCore:
 ### Fine-tuning Mixtral Models
 Megatron-Core has full support for Mixtral MoE models, and we provide the checkpoint converter for Mixtral models from huggingface format to MCore format.
 See more details in the [mixtral example](../../../../examples/mixtral/README.md).
+
 
 ### Distributed Checkpointing
 MCore v0.7 introduced fully parallel and asynchronous saving capabilities to distributed checkpointing,
@@ -151,12 +173,13 @@ Usage
 - `--auto-detect-ckpt-format` With this, it can load both distributed checkpointing and legacy checkpointing.
 
 ### Upcycling
-
 Use `--moe-use-upcycling` to enable the upcycling feature, which will load the dense model from the directory specified by `--load`, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.
 
 The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model.
 
 ## MoE training example:
+* For the HPU training example, follow the instructions in [mixtral example](../../../../examples/mixtral/README.md).
+* For the GPU training example, see below:
 <details>
 <summary>Click here. </summary>
 

@@ -603,19 +603,35 @@ class IntelDynamicMLP(MegatronModule):
     This class is designed to execute multiple experts in parallel, thereby maximizing computational efficiency. It can process expert FFN with 2 (default) or 3 separate weight tensors and different activation functions: silu, gelu, relu.
     """
 
-    def __init__(self, num_local_experts: int, config: TransformerConfig):
+    def __init__(
+        self, num_local_experts: int, local_expert_indices: list, config: TransformerConfig
+    ):
         super().__init__(config=config)
 
-        self.config: TransformerConfig = config
+        self.config = config
         self.num_local_experts = num_local_experts
-        assert (
-            config.add_bias_linear == False
-        ), "bias in the expert layer is not supported in IntelDynamicMLP yet, please set '--disable-bias-linear' instead."
+        self.local_expert_indices = local_expert_indices
+        # local_expert_indices indicate MLPs processed on the local device
+        # i.e. with 8 experts EP=2, there're 2 groups:
+        # local_expert_indices=[0, 1, 2, 3] on ep_rank 0
+        # local_expert_indices=[4, 5, 6, 7] on ep_rank 1
 
+        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        self.ep_rank = parallel_state.get_expert_model_parallel_rank()
         self.expert_parallel = config.expert_model_parallel_size > 1
-        assert not self.expert_parallel, "EP is not supported in IntelDynamicMLP yet."
-        self.moe_extended_tp = config.moe_extended_tp
-        assert not self.moe_extended_tp, "moe_extended_tp is not supported in IntelDynamicMLP yet."
+        assert self.num_local_experts == len(
+            self.local_expert_indices
+        ), f"[ep={self.ep_rank}, tp={self.tp_rank}] local expert indices mismatch"
+        assert (
+            not self.config.add_bias_linear
+        ), "bias in the expert layer is not supported in IntelDynamicMLP yet, please set '--disable-bias-linear' instead."
+        assert (
+            not self.config.context_parallel_size > 1
+        ), "context parallel is not supported in IntelDynamicMLP yet."
+        assert (
+            not self.config.moe_extended_tp
+        ), "moe_extended_tp is not supported in IntelDynamicMLP yet."
         assert not self.config.fp8, "FP8 is not supported in IntelDynamicMLP yet."
 
         self.permuted_weights = config.moe_permuted_weights  # HPU default is True
@@ -633,10 +649,9 @@ class IntelDynamicMLP(MegatronModule):
                 f"IntelDynamicMLP activation function supported: ['silu', 'gelu', 'relu'], got: {self.config.activation_func}"
             )
 
-        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
         fc1_output_size = self.config.ffn_hidden_size * self.num_local_experts
         fc2_input_size = self.config.ffn_hidden_size * self.num_local_experts
-        fc1_output_size *= 2
+        fc1_output_size *= 2  # SwiGLU
 
         fc1_output_size_per_partition = divide(fc1_output_size, self.tp_size)
         fc2_input_size_per_partition = divide(fc2_input_size, self.tp_size)
@@ -646,82 +661,168 @@ class IntelDynamicMLP(MegatronModule):
         fc2_input_size_per_partition_per_expert = divide(
             fc2_input_size_per_partition, self.num_local_experts
         )
-        expert_range = range(self.num_local_experts)
-        if self.fused_weights:  # default
-            w1_shape = (fc1_output_size_per_partition_per_expert, config.hidden_size)
-            w2_shape = (config.hidden_size, fc2_input_size_per_partition_per_expert)
+        if self.fused_weights:  # packed weights SwiGLU is used by default
+            fc1_shape = (fc1_output_size_per_partition_per_expert, config.hidden_size)
+            fc2_shape = (config.hidden_size, fc2_input_size_per_partition_per_expert)
             dim1, dim2 = 0, 1
             if not self.permuted_weights:
-                w1_shape = (w1_shape[1], w1_shape[0])
-                w2_shape = (w2_shape[1], w2_shape[0])
+                fc1_shape = (fc1_shape[1], fc1_shape[0])
+                fc2_shape = (fc2_shape[1], fc2_shape[0])
                 dim1, dim2 = 1, 0
-            w1 = [self.initialize_moe_weight(shape=w1_shape, dim=dim1) for _ in expert_range]
-            w2 = [self.initialize_moe_weight(shape=w2_shape, dim=dim2) for _ in expert_range]
-            self.expert_weights = (w1, w2)
-        else:
+            fc1_wei = []
+            fc2_wei = []
+            for e in self.local_expert_indices:
+                fc1_wei.append(
+                    self.initialize_moe_weight(
+                        layer=self,
+                        shape=fc1_shape,
+                        dim=dim1,
+                        label=f'local_expert_{e}_linear_fc1_weight',
+                        use_output_layer_init_method=False,
+                    )
+                )
+                fc2_wei.append(
+                    self.initialize_moe_weight(
+                        layer=self,
+                        shape=fc2_shape,
+                        dim=dim2,
+                        label=f'local_expert_{e}_linear_fc2_weight',
+                        use_output_layer_init_method=True,
+                    )
+                )
+            self.expert_weights = (fc1_wei, fc2_wei)
+        else:  # standard SwiGLU with 3 separate weights
             ffn_hidden_size_per_partition = divide(self.config.ffn_hidden_size, self.tp_size)
-            w1_shape = (ffn_hidden_size_per_partition, config.hidden_size)
-            w2_shape = (config.hidden_size, fc2_input_size_per_partition_per_expert)
+            fc1_shape = (ffn_hidden_size_per_partition, config.hidden_size)
+            fc2_shape = (config.hidden_size, fc2_input_size_per_partition_per_expert)
             dim1, dim2 = 0, 1
             if not self.permuted_weights:
-                w1_shape = (w1_shape[1], w1_shape[0])
-                w2_shape = (w2_shape[1], w2_shape[0])
+                fc1_shape = (fc1_shape[1], fc1_shape[0])
+                fc2_shape = (fc2_shape[1], fc2_shape[0])
                 dim1, dim2 = 1, 0
-            w11 = [self.initialize_moe_weight(shape=w1_shape, dim=dim1) for _ in expert_range]
-            w12 = [self.initialize_moe_weight(shape=w1_shape, dim=dim1) for _ in expert_range]
-            w2 = [self.initialize_moe_weight(shape=w2_shape, dim=dim2) for _ in expert_range]
-            self.expert_weights = (w11, w12, w2)
+            fc1_wei1 = []
+            fc1_wei2 = []
+            fc2_wei = []
+            for e in self.local_expert_indices:
+                fc1_wei1.append(
+                    self.initialize_moe_weight(
+                        layer=self,
+                        shape=fc1_shape,
+                        dim=dim1,
+                        label=f'local_expert_{e}_linear_fc11_weight',
+                        use_output_layer_init_method=False,
+                    )
+                )
+                fc1_wei2.append(
+                    self.initialize_moe_weight(
+                        layer=self,
+                        shape=fc1_shape,
+                        dim=dim1,
+                        label=f'local_expert_{e}_linear_fc12_weight',
+                        use_output_layer_init_method=False,
+                    )
+                )
+                fc2_wei.append(
+                    self.initialize_moe_weight(
+                        layer=self,
+                        shape=fc2_shape,
+                        dim=dim2,
+                        label=f'local_expert_{e}_linear_fc2_weight',
+                        use_output_layer_init_method=True,
+                    )
+                )
+            self.expert_weights = (fc1_wei1, fc1_wei2, fc2_wei)
 
-    def forward(self, hidden_states: torch.Tensor, probs: torch.Tensor, indices: torch.Tensor):
-        original_shape = hidden_states.shape
+    def forward(
+        self, hidden_states: torch.Tensor, router_weights: torch.Tensor, indices: torch.Tensor
+    ):
+
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
 
-        fc2_output = torch.ops.hpu.mixture_of_experts(
+        output = torch.ops.hpu.mixture_of_experts(
             hidden_states,
             indices,
-            probs,
+            router_weights,
             *self.expert_weights,
             permuted_weights=self.permuted_weights,
             activation=self.activation_fn,
-            experts_min=0,
-            experts_max=self.num_local_experts - 1,
+            experts_min=self.local_expert_indices[0],
+            experts_max=self.local_expert_indices[-1],
             recomp=self.config.moe_layer_recompute,
         )
 
-        output = fc2_output.view(original_shape)
-
         return output, None
 
-    def initialize_moe_weight(self, shape: Tuple, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def initialize_moe_weight(
+        self,
+        layer: torch.nn.Module,
+        shape: Tuple,
+        dim: int,
+        label: str,
+        use_output_layer_init_method: bool,
+    ) -> torch.Tensor:
 
         device = (
             torch.device('cpu')
             if self.config.use_cpu_initialization
             else torch.cuda.current_device()
         )
+        init_method = (
+            self.config.output_layer_init_method
+            if use_output_layer_init_method
+            else self.config.init_method
+        )
 
-        weight = Parameter(torch.empty(*shape, device=device, dtype=self.config.params_dtype))
         if self.config.perform_initialization:
             if self.config.use_cpu_initialization:
+                # Parameter: [ output_size_per_partition, output_size, input_size ]
                 if dim == 0:
-                    cpu_shape = (shape[0] * self.tp_size, self.config.hidden_size, shape[0])
+                    output_size = shape[0] * self.tp_size
+                    input_size = self.config.hidden_size
+                    size_per_partition = shape[0]
+                    weight = Parameter(
+                        torch.empty(
+                            size_per_partition,
+                            input_size,
+                            device=device,
+                            dtype=self.config.params_dtype,
+                        )
+                    )
                 elif dim == 1:
-                    cpu_shape = (self.config.hidden_size, shape[1] * self.tp_size, shape[1])
+                    output_size = self.config.hidden_size
+                    input_size = shape[1] * self.tp_size
+                    size_per_partition = shape[1]
+                    weight = Parameter(
+                        torch.empty(output_size, size_per_partition, dtype=self.config.params_dtype)
+                    )
                 else:
                     raise ValueError(f"Wrong partition dimension {dim} not in (0,1)")
 
+                layer.register_parameter(label, weight)
+                rank = self.tp_rank
+                world_size = self.tp_size
+
                 _initialize_affine_weight_cpu(
                     weight,
-                    *cpu_shape,
+                    output_size,
+                    input_size,
+                    size_per_partition,
                     partition_dim=dim,
-                    init_method=self.config.init_method,
+                    init_method=init_method,
                     params_dtype=self.config.params_dtype,
+                    rank=rank,
+                    world_size=world_size,
                 )
                 weight = weight.to(torch.cuda.current_device())
             else:
+                weight = Parameter(
+                    torch.empty(*shape, device=device, dtype=self.config.params_dtype)
+                )
+                layer.register_parameter(label, weight)
+
                 _initialize_affine_weight_gpu(
                     weight,
-                    self.config.init_method,
+                    init_method=init_method,
                     partition_dim=dim,
                     expert_parallel=self.expert_parallel,
                 )

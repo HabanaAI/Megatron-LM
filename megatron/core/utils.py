@@ -292,10 +292,19 @@ def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs:
         logger.log(*args, **kwargs)
 
 
-def print_rank_0(message):
-    """If distributed is initialized, print only on rank 0."""
+def print_rank_0(message, group=None):
+    """If distributed is initialized, print only on rank 0.
+
+    Args:
+        message (str): A message to be printed.
+
+        group (ProcessGroup, optional): If specified, the message will be
+            printed by rank 0 of the given process group. If not specified,
+            the global rank 0 will print the message.
+    """
+
     if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
+        if torch.distributed.get_rank(group) == 0:
             print(message, flush=True)
     else:
         print(message, flush=True)
@@ -318,6 +327,55 @@ def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any
         and parallel_state.get_tensor_model_parallel_rank() == 0
     ):
         logger.log(*args, **kwargs)
+
+
+def get_node_data_parallel_ranks(data_parallel_global_ranks):
+    """
+    Assigns data parallel groups to appropriate nodes.
+
+    Args:
+        data_parallel_global_ranks List[int]: Data parallel global ranks of a given group.
+
+    Returns:
+        node_data_parallel_global_ranks (List[List[int]]): List of data
+            parallel global ranks assigned to a given node. Additionally
+            divided into data parallel groups.
+
+        node_ranks (List[int]): Rank ranges for data parallel ranks associated
+            with a given node.
+    """
+
+    device_count = torch.cuda.device_count()
+    num_nodes = torch.distributed.get_world_size() // device_count
+
+    all_data_parallel_global_ranks = parallel_state.get_all_data_parallel_ranks()
+
+    # Group ranks by nodes
+    num_groups_per_node = len(all_data_parallel_global_ranks) // num_nodes
+
+    all_data_parallel_global_ranks_grouped_by_nodes = [
+        all_data_parallel_global_ranks[i : i + num_groups_per_node]
+        for i in range(0, len(all_data_parallel_global_ranks), num_groups_per_node)
+    ]
+
+    # Find a node id that the data parallel group will use for loading.
+    node_id = next(
+        (
+            i
+            for i, dp_ranks in enumerate(all_data_parallel_global_ranks_grouped_by_nodes)
+            if data_parallel_global_ranks in dp_ranks
+        ),
+        None,
+    )
+    assert node_id is not None
+
+    # Determine the rank ranges for data parallel ranks associated with a specific node.
+    node_ranks = list(range(device_count * node_id, device_count * node_id + device_count))
+
+    # Get all data parallel groups for a given node.
+    node_data_parallel_global_ranks = all_data_parallel_global_ranks_grouped_by_nodes[node_id]
+
+    return node_data_parallel_global_ranks, node_ranks
 
 
 def check_param_hashes_across_dp_replicas(

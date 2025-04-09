@@ -23,7 +23,7 @@ from megatron.core.models.retro.utils import (
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_real_cuda_device_available, is_lazy_mode
 from megatron.training.activations import squared_relu
-from megatron.training.utils import update_use_dist_ckpt
+from megatron.training.utils import update_use_dist_ckpt, print_rank_0
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -703,6 +703,20 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
 
+    if args.moe_capacity_bins_num != 0:
+        print_rank_0("Using dropless mode with Capacity Bins")
+        args.moe_pad_expert_input_to_capacity = True
+        args.moe_dynamic_hpu = False
+        args.moe_expert_capacity_factor = None
+        assert args.moe_token_dispatcher_type == "alltoall", 'moe_capacity_bins require alltoall token dispatcher'
+
+    if args.moe_dynamic_hpu:
+        print_rank_0("Using dropless mode with HPU Dynamic MoE Kernel `IntelDynamicMLP`")
+        assert not cuda_available, "moe_dynamic_hpu can be used only with HPU-specific Dynamic MoE kernels."
+        args.moe_pad_expert_input_to_capacity = False
+        args.moe_capacity_bins_num = 0
+        args.moe_expert_capacity_factor = None
+        args.moe_token_dispatcher_type = None
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1590,6 +1604,20 @@ def _add_checkpointing_args(parser):
     group.add_argument("--verify-checkpoint-model-type", default='LLAMA', type=str,
                        help='Model family type, used for checkpoint verification only.',
                        choices=['LLAMA', 'MIXTRAL'])
+    group.add_argument("--save-distrib-optimizer-method", default='serial_per_node',
+                       type=str, help='Methods for exporting distributed optimizer states,'
+                       ' balancing memory savings and performance. `parallel_multi_node`'
+                       ' saves more memory than `parallel_node_0` at the same speed.'
+                       ' `serial_per_node` saves even more but is slower, while'
+                       ' `serial_per_dp_groups` is the slowest yet most memory-efficient.',
+                       choices=['parallel_node_0', 'parallel_multi_node',
+                                'serial_per_node', 'serial_per_dp_groups'])
+    group.add_argument("--load-distrib-optimizer-method", default='serial_per_dp_groups',
+                       type=str, help='Methods for loading distributed optimizer states,'
+                       ' balancing memory savings and performance. '
+                       ' See --save-distrib-optimizer-method for more details.',
+                       choices=['parallel_node_0', 'parallel_multi_node',
+                                'serial_per_node', 'serial_per_dp_groups'])
     return parser
 
 
