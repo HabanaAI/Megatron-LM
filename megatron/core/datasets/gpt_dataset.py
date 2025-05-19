@@ -80,7 +80,8 @@ class GPTDataset(MegatronDataset):
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When
+            None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -326,7 +327,8 @@ class GPTDataset(MegatronDataset):
             -- A random permutation of index range of the sample index
 
         Returns:
-            Tuple[numpy.ndarray, numpy.ndarray]: The document index, the sample index, and the shuffle index
+            Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: The document index, the sample
+            index, and the shuffle index
         """
         path_to_cache = self.config.path_to_cache
         if path_to_cache is None and not self.config.mock:
@@ -335,10 +337,8 @@ class GPTDataset(MegatronDataset):
             )
 
         if path_to_cache:
-            get_path_to = lambda suffix: os.path.join(
-                path_to_cache,
-                f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}-{suffix}",
-            )
+            base = f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}"
+            get_path_to = lambda affix: os.path.join(path_to_cache, f"{base}-{affix}")
             path_to_description = get_path_to("description.txt")
             path_to_document_index = get_path_to("document_index.npy")
             path_to_sample_index = get_path_to("sample_index.npy")
@@ -518,7 +518,7 @@ class GPTDataset(MegatronDataset):
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    f"Unable to save the {type(self).__name__} indexes because path_to_cache is None",
+                    f"Unable to save {type(self).__name__} indexes because path_to_cache is None",
                 )
 
             t_end = time.time()
@@ -643,7 +643,8 @@ def _build_shuffle_index(
     Args:
         num_samples (int): The size of the first shuffle range [0, num_samples)
 
-        total_size (int): The size of the entire index. If larger than 'num_samples', it defines the second shuffle range [num_samples, total_size)
+        total_size (int): The size of the entire index. If larger than 'num_samples', it defines
+            the second shuffle range [num_samples, total_size)
 
         numpy_random_state (numpy.random.RandomState): The NumPy random state
 
@@ -686,7 +687,8 @@ def _get_ltor_masks_and_position_ids(
 
         eod_mask_loss (bool): Switch to enable the EOD mask loss
 
-        create_attention_mask (bool): Switch to enable the attention masks generation. Can be disabled if attention kernel generates masks by itself.
+        create_attention_mask (bool): Switch to enable the attention masks generation. Can be
+            disabled if attention kernel generates masks by itself.
 
     Returns:
         torch.Tensor: Attention mask needed to be used for Attention
@@ -742,10 +744,24 @@ def _get_ltor_masks_and_position_ids(
 
 
 class MockGPTLowLevelDataset:
+    """The mock GPT low level dataset
+
+    This class is meant to generate tokenized data in the classic "Megatron-LM" GPT style. Notably,
+    we add the end of document token to each element indexed in __getitem__
+
+    Args:
+        tokenizer (MegatronTokenizer): The tokenizer the special token information of which we use
+            to augment the mock data.
+    """
 
     seed: int = 0
+    """The hard-coded random seed to use to set the NumPy RNG"""
+
     size: int = 100000
+    """The hard-coded number of samples to generate"""
+
     max_sequence_length: int = 4096
+    """The hard-coded max sequence length to generate"""
 
     def __init__(self, tokenizer: MegatronTokenizer) -> None:
         self.tokenizer = tokenizer
@@ -765,6 +781,18 @@ class MockGPTLowLevelDataset:
         return sample
 
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
+        """This function is n abstraction over __getitem__ with support for slicing
+
+        Args:
+            idx (int): The index into the dataset
+
+            offset (int): The integer token offset in the sequence
+
+            length (Optional[int]): The number of tokens to grab from the sequence
+
+        Returns:
+            numpy.ndarray: The sequence tokens at the index
+        """
         if length is None:
             length = self.sequence_lengths[idx] - offset
         return self[idx][offset : offset + length]
@@ -774,7 +802,8 @@ class MockGPTDataset(GPTDataset):
     """The mock GPT dataset
 
     Args:
-        indexed_dataset (MockGPTLowLevelDataset): The MockGPTLowLevelDataset around which to build the MockGPTDataset
+        indexed_dataset (MockGPTLowLevelDataset): The MockGPTLowLevelDataset around which to build
+            the MockGPTDataset
 
         dataset_path (Optional[str]): This argument is of no consequence for the MockGPTDataset
 
@@ -819,7 +848,8 @@ class MockGPTDataset(GPTDataset):
         """Abstract method implementation
 
         Args:
-            dataset_path (Optional[str]): This argument is of no consequence for the MockGPTLowLevelDataset
+            dataset_path (Optional[str]): This argument is of no consequence for the
+                MockGPTLowLevelDataset
 
             config (GPTDatasetConfig): The config
 

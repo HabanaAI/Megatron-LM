@@ -26,7 +26,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-class TestTextGenerationController:
+class TestSimpleTextGenerationController:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(
@@ -54,7 +54,7 @@ class TestTextGenerationController:
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=self.hidden_size,
-            inference_batch_times_seqlen_threshold=20,
+            inference_batch_times_seqlen_threshold=-1,
             fp32_residual_connection=False,
             params_dtype=torch.float,
             padded_vocab_size=self.vocab_size,

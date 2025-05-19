@@ -1,4 +1,3 @@
-# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
@@ -34,12 +33,7 @@ class AuxlossTestContainer(MoEModelTestContainer):
 
 
 class TestAuxLoss:
-    @pytest.fixture(autouse=True)
-    def setup_method(self, request):
-        if hasattr(request.node, 'callspec'):
-            deterministic_mode = request.node.callspec.params.get('deterministic_mode', False)
-        else:
-            deterministic_mode = False
+    def setup_method(self, method):
         baseline_container = AuxlossTestContainer(
             tp_size=1,
             ep_size=1,
@@ -50,7 +44,6 @@ class TestAuxLoss:
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="alltoall",
             moe_aux_loss_coeff=0.1,
-            deterministic_mode=deterministic_mode,
         )
         moe_layer = baseline_container.moe_layer
         self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
@@ -61,16 +54,16 @@ class TestAuxLoss:
         self.input.grad = None
         clear_aux_losses_tracker()
 
-    def teardown_method(self):
+    def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
-    @pytest.mark.parametrize("deterministic_mode", [True])  # TODO: add False
-    def test_allgather_dispatcher(self, tp_size, ep_size, cp_size, deterministic_mode):
+    def test_allgather_dispatcher(self, tp_size, ep_size, cp_size):
         container = AuxlossTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -81,17 +74,16 @@ class TestAuxLoss:
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="allgather",
             moe_aux_loss_coeff=0.1,
-            deterministic_mode=deterministic_mode,
         )
         container.aux_loss_test(self.input, self.baseline_grad)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
-    @pytest.mark.parametrize("deterministic_mode", [True])  # TODO: add False
-    def test_a2a_dispatcher(self, tp_size, ep_size, cp_size, deterministic_mode):
+    def test_a2a_dispatcher(self, tp_size, ep_size, cp_size):
         container = AuxlossTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -102,6 +94,5 @@ class TestAuxLoss:
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="alltoall",
             moe_aux_loss_coeff=0.1,
-            deterministic_mode=deterministic_mode,
         )
         container.aux_loss_test(self.input, self.baseline_grad)

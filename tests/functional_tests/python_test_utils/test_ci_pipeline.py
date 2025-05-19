@@ -1,5 +1,3 @@
-# © 2024-2025 Intel Corporation
-
 import os
 from typing import List, Union
 
@@ -22,7 +20,7 @@ def expected_data(request):
 
 # If we require a variation of tests for any of the other pipelines we can just inherit this class.
 class TestCIPipeline:
-    allow_nondeterministic = bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")))
+    allow_nondeterministic = bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO")))
     logs_dir = os.getenv("LOGS_DIR")
 
     # Replace symbol in namespace to fix function call result for lifetime of
@@ -70,8 +68,6 @@ exports this metric as its required by the test case/golden values file"
         if expected_metric in TYPE_OF_TEST_TO_METRIC[TypeOfTest.APPROX]:
             self._test_helper(expected_metric, expected_values, TypeOfTest.APPROX)
         else:
-            if not expected_values['values']:
-                pytest.skip(reason="skipping test as EXPECTED_METRICS_FILE is not set.")
             print(f"Skipping metric {expected_metric} for approximate as it is deterministic only.")
 
     @pytest.mark.skipif(allow_nondeterministic, reason="Cannot expect exact results")
@@ -81,8 +77,6 @@ exports this metric as its required by the test case/golden values file"
         if expected_metric in TYPE_OF_TEST_TO_METRIC[TypeOfTest.DETERMINISTIC]:
             self._test_helper(expected_metric, expected_values, TypeOfTest.DETERMINISTIC)
         else:
-            if not expected_values['values']:
-                pytest.skip(reason="skipping test as EXPECTED_METRICS_FILE is not set.")
             print(f"Skipping metric {expected_metric} for deterministic as it is approximate only.")
 
     # # @TODO: This is inactive, do we want to activate it?

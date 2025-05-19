@@ -1,6 +1,4 @@
-# © 2024-2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
 import torch
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -30,16 +28,17 @@ try:
     import apex
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
     import warnings
 
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
+    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    LNImpl = WrappedTorchNorm
 
 
 def get_layer_spec(is_vit, normalization) -> ModuleSpec:
@@ -47,7 +46,21 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
     if normalization == "LayerNorm":
         norm = LNImpl
     elif normalization == "RMSNorm":
-        norm = TENorm
+        if HAVE_TE:
+            norm = TENorm
+        else:
+            version = torch.__version__.split('.')
+            version_geq_2_4 = (
+                int(TORCH_VERSION[0]) > 2
+                or (
+                    int(TORCH_VERSION[0]) == 2
+                    and int(TORCH_VERSION[1]) >= 4
+                )
+            )
+            assert version_geq_2_4, "Torch version >= 2.4.0 is required for RMSNorm"
+            if HAVE_APEX:
+                warnings.warn(f'Apex does not support RMSNorm. Falling back to Torch Norm')
+            norm = WrappedTorchNorm
     else:
         raise RuntimeError("unknown normalization", normalization)
 

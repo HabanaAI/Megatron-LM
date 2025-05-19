@@ -41,10 +41,10 @@ try:
 except ImportError:
     import warnings
 
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
+    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    LNImpl = WrappedTorchNorm
 
 try:
     from megatron.core.extensions.intel_transformer_engine import (
@@ -134,7 +134,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             pre_cross_attn_layernorm=normalization_class,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
-                params={"attn_mask_type": AttnMaskType.arbitrary},
+                params={"attn_mask_type": AttnMaskType.padding},
                 submodules=CrossAttentionSubmodules(
                     linear_q=linear_q,
                     linear_kv=linear_kv,

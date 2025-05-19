@@ -298,7 +298,8 @@ def convert_layers(
     output_state_dict: dict,
     capacity_bins_state_dict: dict,
     layer_re: re.Pattern,
-    moe_op_name_re: re.Pattern,
+    moe_dynamic_layer_re: re.Pattern,
+    moe_layer_re: re.Pattern,
     capacity_bins_re: re.Pattern,
     tp_size: int,
     pp_size: int,
@@ -317,14 +318,21 @@ def convert_layers(
     rotary_base: float,
     dtype: torch.dtype,
     save_capacity_bins: bool,
+    moe_dynamic_hpu: bool = False,
 ):
     # Extract the layers.
     for key, val in tp_state_dicts[0]["model"].items():
         try:
-            # Match the name.
-            match = layer_re.match(key)
+            is_expert_layer = "experts.local_expert" in key
 
-            is_expert_layer = "experts.local_experts" in key
+            # Match the name.
+            if is_expert_layer:
+                if moe_dynamic_hpu:
+                    match = moe_dynamic_layer_re.match(key)
+                else:
+                    match = moe_layer_re.match(key)
+            else:
+                match = layer_re.match(key)
 
             if source_model_type == 'mixtral':
                 # For ep ranks > 0 we convert only MoE layers.
@@ -343,7 +351,7 @@ def convert_layers(
             moe_layer_idx = None
 
             # The name of the operation.
-            op_name = match.group(3)
+            op_name = match.group(5) if is_expert_layer else match.group(3)
 
             if save_capacity_bins and "capacity_bins" in key:
                 # There are different capacity bins values for each rank and layer.
@@ -375,13 +383,11 @@ def convert_layers(
                 continue
 
             # Is it a weight or a bias?
-            weight_or_bias = match.group(4)
+            weight_or_bias = match.group(6) if is_expert_layer else match.group(4)
 
             # Extract the layer index and operation name of the MoE layer.
             if is_expert_layer:
-                moe_match = moe_op_name_re.match(op_name)
-                moe_layer_idx = int(moe_match.group(1)) + ep_rank * num_layers_per_ep_stage
-                op_name = moe_match.group(2)
+                moe_layer_idx = int(match.group(4)) + ep_rank * num_layers_per_ep_stage
 
             # The name of the layer.
             layer_name = f"model.layers.{layer_idx}"
@@ -573,7 +579,6 @@ def convert_checkpoint_from_megatron_to_transformers(args):
 
     # Create Transformers config from Megatron-LM arguments
     assert megatron_args.vocab_size is not None, "vocab_size must not be None"
-    vocab_size = megatron_args.vocab_size
 
     # params dtype
     dtype_mapping = {
@@ -604,6 +609,13 @@ def convert_checkpoint_from_megatron_to_transformers(args):
         router_jitter_noise=0.0 if megatron_args.moe_input_jitter_eps is None else megatron_args.moe_input_jitter_eps
 
         hidden_act = "silu" if megatron_args.swiglu else "gelu"
+
+        if megatron_args.vocab_size != megatron_args.padded_vocab_size:
+            assert megatron_args.padded_vocab_size is not None, "padded_vocab_size must not be None"
+
+            print(f"Setting vocab_size={megatron_args.vocab_size} to padded_vocab_size={megatron_args.padded_vocab_size}")
+
+            vocab_size = megatron_args.padded_vocab_size
     else:
         # Sourced from
         # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py#L207
@@ -636,7 +648,7 @@ def convert_checkpoint_from_megatron_to_transformers(args):
     if args.source_model_type == 'mixtral':
         # Mixtral Config
         config = MixtralConfig(
-            vocab_size=megatron_args.vocab_size,
+            vocab_size=vocab_size,
             hidden_size=megatron_args.hidden_size,
             intermediate_size=megatron_args.ffn_hidden_size,
             num_hidden_layers=megatron_args.num_layers,
@@ -706,6 +718,11 @@ def convert_checkpoint_from_megatron_to_transformers(args):
     if args.source_model_type == 'mixtral':
         ep_size = megatron_args.expert_model_parallel_size
         ep_rank = 0
+
+        # TODO: add support for expert_tensor_parallel
+        assert not megatron_args.moe_extended_tp, "MoE extended TP is currently not supported for conversion."
+        assert megatron_args.expert_tensor_parallel_size == megatron_args.tensor_model_parallel_size, "Expert tensor parallel size different than tensor parallel size is currently not supported."
+
         moe_tp = megatron_args.moe_extended_tp
     else:
         ep_size = None
@@ -715,8 +732,10 @@ def convert_checkpoint_from_megatron_to_transformers(args):
     # The regex to extract layer names.
     # Example: "decoder.layers.0.self_attention.linear_proj.weight"
     layer_re = re.compile(r"([a-z0-9_.]+)\.layers\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
-    # Example: "decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight"
-    moe_op_name_re = re.compile(r"mlp\.experts\.local_experts\.(\d+)\.([a-z0-9_.]+)")
+    # Example: "decoder.layers.0.mlp.experts.local_expert_0_linear_fc1_weight"
+    moe_dynamic_layer_re = re.compile(r"([a-z0-9_.]+)\.layers\.(\d+)\.([a-z0-9_.]+)\_expert\_(\d+)\_([a-z0-9_.]+)\_([a-z]+)")
+    # Example: "mlp.experts.local_experts.0.linear_fc1.weight"
+    moe_layer_re = re.compile(r"([a-z0-9_.]+)\.layers\.(\d+)\.([a-z0-9_.]+)\.local_experts\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
     # Example: "decoder.layers.0.mlp.router.capacity_bins.bins_usage"
     capacity_bins_re = re.compile(r"([a-z0-9_.]+)\.capacity_bins\.([a-z_.]+)")
 
@@ -767,12 +786,12 @@ def convert_checkpoint_from_megatron_to_transformers(args):
         layer_idx = convert_layers(
             args.source_model_type, tp_state_dicts, moe_tp_state_dicts,
             output_state_dict, capacity_bins_state_dict, layer_re,
-            moe_op_name_re, capacity_bins_re, tp_size, pp_size, pp_rank,
-            ep_size, ep_rank, moe_tp, megatron_args.num_layers,
+            moe_dynamic_layer_re, moe_layer_re, capacity_bins_re, tp_size,
+            pp_size, pp_rank, ep_size, ep_rank, moe_tp, megatron_args.num_layers,
             num_layers_per_pp_stage, num_layers_per_ep_stage, qkv_total_dim,
             hidden_size, heads_per_group, hidden_size_per_head,
             num_query_groups, float(megatron_args.rotary_base), dtype,
-            args.save_capacity_bins
+            args.save_capacity_bins, megatron_args.moe_dynamic_hpu
         )
 
     if not moe_tp and args.source_model_type == "mixtral":
@@ -785,13 +804,13 @@ def convert_checkpoint_from_megatron_to_transformers(args):
                 layer_idx = convert_layers(
                     args.source_model_type, tp_state_dicts, moe_tp_state_dicts,
                     output_state_dict, capacity_bins_state_dict, layer_re,
-                    moe_op_name_re, capacity_bins_re, tp_size, pp_size, pp_rank,
-                    ep_size, ep_rank, False, megatron_args.num_layers,
-                    num_layers_per_pp_stage, num_layers_per_ep_stage,
-                    qkv_total_dim, hidden_size, heads_per_group,
-                    hidden_size_per_head, num_query_groups,
+                    moe_dynamic_layer_re, moe_layer_re, capacity_bins_re,
+                    tp_size, pp_size, pp_rank, ep_size, ep_rank, False,
+                    megatron_args.num_layers, num_layers_per_pp_stage,
+                    num_layers_per_ep_stage, qkv_total_dim, hidden_size,
+                    heads_per_group, hidden_size_per_head, num_query_groups,
                     float(megatron_args.rotary_base), dtype,
-                    args.save_capacity_bins
+                    args.save_capacity_bins, megatron_args.moe_dynamic_hpu
                 )
 
 

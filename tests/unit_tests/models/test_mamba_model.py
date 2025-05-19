@@ -126,4 +126,13 @@ class TestMambaModel:
         path = tmp_path / "model.pt"
         torch.save(self.model.state_dict(), path)
 
-        self.model.load_state_dict(torch.load(path, weights_only=False))
+        self.model.load_state_dict(torch.load(path))
+
+    def test_layer_numbers(self):
+        """
+        The layer numbers should start at one (for the embedding # layer) and go up
+        incrementally from there. This is required for PEFT to work.
+        """
+        model = self.model
+        for expected, layer in enumerate(model.decoder.layers, start=1):
+            assert expected == layer.layer_number, "layer numbers are incorrect"

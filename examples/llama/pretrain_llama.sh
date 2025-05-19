@@ -48,7 +48,7 @@ USE_FUSED_SDPA=${HL_USE_FUSED_SDPA:-1}
 USE_FUSED_SDPA_WITH_RECOMPUTE=${HL_USE_FUSED_SDPA_WITH_RECOMPUTE:-0}
 USE_FAST_SOFTMAX=${HL_USE_FAST_SOFTMAX:-1}
 USE_FUSED_RMSNORM=${HL_USE_FUSED_RMSNORM:-1}
-PROFILE_TYPE=${HL_PROFILE_TYPE:-} # provide either of pt, pt-full, hltv
+PROFILE_TYPE=${HL_PROFILE_TYPE:-} # provide either of pt, pt-full
 PROFILE_STEP_START=${HL_PROFILE_STEP_START:-3}
 PROFILE_STEP_END=${HL_PROFILE_STEP_END:-4}
 PROFILE_RANKS=${HL_PROFILE_RANKS:-"0"} # "0 1 4 7"
@@ -58,14 +58,24 @@ FP8=${HL_FP8:-0}
 FP8_FORMAT=${HL_FP8_FORMAT:-hybrid} # hybrid or e5m2
 FP8_MARGIN=${HL_FP8_MARGIN:-0}
 FP8_AMAX_COMPUTE_ALGO=${HL_FP8_AMAX_COMPUTE_ALGO:-max} # max or most_recent
+FP8_SMOOTH_SWIGLU=${HL_FP8_SMOOTH_SWIGLU:-1}
 USE_TORCH_COMPILE=${HL_USE_TORCH_COMPILE:-0}
 USE_TORCH_COMPILED_AUTOGRAD=${HL_USE_TORCH_COMPILED_AUTOGRAD:-0}
+TORCH_COMPILE_DISABLE=${HL_TORCH_COMPILE_DISABLE:-0}
+CACHE_SIZE_LIMIT=${HL_CACHE_SIZE_LIMIT:-0}
 USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
 SKIP_TRAIN=${HL_SKIP_TRAIN:-0}
 NUM_WORKERS=${HL_NUM_WORKERS:-2}
-FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=False attention=True"}
+FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=True"}
 CACHE_FP8_WEIGHT=${HL_CACHE_FP8_WEIGHT:-1}
 CACHE_FP8_WEIGHT_FWD=${HL_CACHE_FP8_WEIGHT_FWD:-1}
+ENV_FLAGS=${HL_ENV_FLAGS:-} #"a=1,b=2,c=3"
+NO_LOAD_OPTIM=${HL_NO_LOAD_OPTIM:-0}
+NO_LOAD_RNG=${HL_NO_LOAD_RNG:-0}
+OVERLAP_GRAD_REDUCE=${HL_OVERLAP_GRAD_REDUCE:-0}
+TORCHRUN_MULTINODE=${HL_TORCHRUN_MULTINODE:-0}
+TORCHRUN_NODE_RANK=${HL_TORCHRUN_NODE_RANK:-0}
+TORCHRUN_MASTER_ADDR=${HL_TORCHRUN_MASTER_ADDR:-localhost}
 
 if [[ -z "${MEGATRON_LM_ROOT}" ]]; then
     MEGATRON_LM_ROOT=$(realpath "$(dirname "$0")"/../../)
@@ -201,6 +211,27 @@ elif [[ "${LLAMA_VER}" = "3.1" ]]; then
         echo "incorrect HL_LLAMA_MODEL_SIZE=${LLAMA_MODEL_SIZE} is set"
         exit 1
     fi
+elif [[ "${LLAMA_VER}" = "3.2" ]]; then
+    TOKENIZER_TYPE=${HL_TOKENIZER_TYPE:-HuggingFaceTokenizer}
+    GLOBAL_BATCH_SIZE=${HL_GBS:-1024} # microbatches in the pipeline (computed as `GLOBAL_BATCH / (DP * MICRO_BATCH)`) should be divisible by the PP
+    MAX_SEQ_LEN=${HL_SEQ_LEN:-8192}
+    TRAIN_ITERS=${HL_TRAIN_ITERS:-937500}
+    ADAM_EPS=1e-5
+    LR_WARMUP_ITERS=8000
+    ROTARY_BASE=500000
+    if [[ "${LLAMA_MODEL_SIZE}" = "1" ]]; then
+        # LLaMA3.1-1B model architecture
+        HIDDEN_SIZE=${HL_HIDDEN_SIZE:-2048}
+        NUM_HEADS=${HL_NUM_HEADS:-32} # must be divisible by TP
+        NUM_QUERY_GROUPS=${HL_NUM_QUERY_GROUPS:-8} # must be divisible by TP
+        NUM_LAYERS=${HL_NUM_LAYERS:-16} # must be divisible by PP
+        FFN_HIDDEN_SIZE=${HL_FFN_HIDDEN_SIZE:-8192}
+        LR=4e-4
+        MIN_LR=4e-6
+    else
+        echo "invalid LLAMA_MODEL_SIZE: ${LLAMA_MODEL_SIZE}"
+        exit 1
+    fi
 else
     echo "invalid LLAMA_VER: ${LLAMA_VER}"
     exit 1
@@ -268,11 +299,10 @@ PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${HL_FP8_ENFORCE_BF16_AMAX_REDUCTION:-1}
 if [[ -z "${HL_TE_LIMIT_GRAPH_SIZE}" ]]; then
     # Limit TE graph size only for LLaMa 3.1 8B scenario
     if [[ "${LLAMA_VER}" = "3.1" ]] && [[ "${LLAMA_MODEL_SIZE}" = "8" ]] && [[ ${DP} = 8 ]] && [[ $((NUM_NODES*DEVICES_PER_NODE)) = 8 ]]; then
-        PT_TE_LIMIT_GRAPH_SIZE=1
+        HL_TE_LIMIT_GRAPH_SIZE=1
     fi
-else
-    PT_TE_LIMIT_GRAPH_SIZE=${HL_TE_LIMIT_GRAPH_SIZE:-0}
 fi
+PT_TE_LIMIT_GRAPH_SIZE=${HL_TE_LIMIT_GRAPH_SIZE:-0}
 
 if [[ "${LLAMA_VER}" = "3.1" ]] && [[ "${LLAMA_MODEL_SIZE}" = "8" ]]; then
     CACHE_FP8_WEIGHT=${HL_CACHE_FP8_WEIGHT:-0}
@@ -284,10 +314,24 @@ if [[ "${LAUNCHER_TYPE}" = "mpirun" ]]; then
     CMD="${CMD} mpirun"
     CMD="${CMD} --allow-run-as-root"
     CMD="${CMD} -n ${NUM_DEVICES}"
-    CMD="${CMD} --bind-to none"
+    [[ -n "$HL_PE" ]] && __MAP_BY="socket:PE=${HL_PE}"
+    [[ -n "$HL_PE" ]] && [[ -n "${HL_PPR}" ]] && __MAP_BY="ppr:${HL_PPR}:socket:PE=${HL_PE}"
+    if [[ -n "${__MAP_BY}" ]]; then
+        CMD="${CMD} --bind-to core --rank-by core --report-bindings --map-by ${__MAP_BY}"
+    else
+        CMD="${CMD} --bind-to none"
+    fi
     CMD="${CMD} -x PT_HPU_GPU_MIGRATION=${PT_HPU_GPU_MIGRATION}"
     CMD="${CMD} -x PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${PT_TE_ENFORCE_BF16_AMAX_REDUCTION}"
     CMD="${CMD} -x PT_TE_LIMIT_GRAPH_SIZE=${PT_TE_LIMIT_GRAPH_SIZE}"
+    CMD="${CMD} -x PT_HPU_LAZY_MODE=${USE_LAZY_MODE}"
+    if [[ "${TORCH_COMPILE_DISABLE}" = "1" ]]; then
+        CMD="${CMD} -x TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE}"
+    fi
+    IFS=',' read -ra ENV_FLAGS_ARR <<< "$ENV_FLAGS"
+    for ENV_FLAG in "${ENV_FLAGS_ARR[@]}"; do
+        CMD="${CMD} -x ${ENV_FLAG}"
+    done
     if [[ "${NUM_NODES}" -ne "1" ]]; then
         CMD="${CMD} -hostfile ${HOSTSFILE}"
         CMD="${CMD} -x MASTER_ADDR=$(head -n 1 "${HOSTSFILE}" | sed -n s/[[:space:]]slots.*//p)"
@@ -296,31 +340,35 @@ if [[ "${LAUNCHER_TYPE}" = "mpirun" ]]; then
     fi
     CMD="${CMD} -x MASTER_PORT=12345"
 elif [[ "${LAUNCHER_TYPE}" = "torchrun" ]]; then
-    if [[ "${NUM_NODES}" -ne "1" ]]; then
+    if [[ "${TORCHRUN_MULTINODE}" -ne "1" ]] && [[ "${NUM_NODES}" -ne "1" ]]; then
         echo "NUM_NODES greater than 1 not supported by torchrun"
         exit 1
     fi
     export PT_HPU_GPU_MIGRATION=${PT_HPU_GPU_MIGRATION}
     export PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${PT_TE_ENFORCE_BF16_AMAX_REDUCTION}
     export PT_TE_LIMIT_GRAPH_SIZE=${PT_TE_LIMIT_GRAPH_SIZE}
+    export PT_HPU_LAZY_MODE=${USE_LAZY_MODE}
+    if [[ "${TORCH_COMPILE_DISABLE}" = "1" ]]; then
+        export TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE}
+    fi
+    IFS=',' read -ra ENV_FLAGS_ARR <<< "$ENV_FLAGS"
+    for ENV_FLAG in "${ENV_FLAGS_ARR[@]}"; do
+        export "${ENV_FLAG?}"
+    done
     CMD="${CMD} torchrun"
     CMD="${CMD} --nnodes ${NUM_NODES}"
     CMD="${CMD} --nproc-per-node ${DEVICES_PER_NODE}"
     CMD="${CMD} --no-python"
-    CMD="${CMD} --node-rank 0"
-    CMD="${CMD} --master-addr localhost"
+    CMD="${CMD} --node-rank ${TORCHRUN_NODE_RANK}"
+    CMD="${CMD} --master-addr ${TORCHRUN_MASTER_ADDR}"
     CMD="${CMD} --master-port 12345"
 else
     echo "Unsupported launcher type = ${LAUNCHER_TYPE}"
     exit 2
 fi
 
-if [ "$USE_LAZY_MODE" = "0" ]; then
-    CMD="${CMD} -x PT_HPU_LAZY_MODE=0"
-fi
-
 CMD="${CMD} \
-    python ${SRC_PATH} \
+    python3 ${SRC_PATH} \
     --transformer-impl ${TRANSFORMER_IMPL} \
     --tensor-model-parallel-size ${TP} \
     --pipeline-model-parallel-size ${PP} \
@@ -352,6 +400,7 @@ CMD="${CMD} \
     --min-lr ${MIN_LR} \
     --use-torch-compile=${USE_TORCH_COMPILE} \
     --use-torch-compiled-autograd=${USE_TORCH_COMPILED_AUTOGRAD} \
+    --cache-size-limit=${CACHE_SIZE_LIMIT} \
     --use-fused-sdpa-with-recompute ${USE_FUSED_SDPA_WITH_RECOMPUTE} \
     --use-fused-sdpa ${USE_FUSED_SDPA} \
     --use-fused-rmsnorm ${USE_FUSED_RMSNORM} \
@@ -377,12 +426,17 @@ CMD="${CMD} \
     --eval-iters ${EVAL_ITERS} \
     --data-path ${DATA_PATH} \
     --num-workers ${NUM_WORKERS} \
+    --distributed-timeout-minutes 60 \
     "
 
 if [[ "${SEQ_PARALLEL}" -eq 1 ]]; then
     CMD="${CMD} --sequence-parallel"
 fi
 
+# Set this for training on > 128 cards
+if [[ ${OVERLAP_GRAD_REDUCE} -eq 1 ]] || [[ ${NUM_DEVICES} -gt 128 ]]; then
+    CMD="${CMD} --overlap-grad-reduce"
+fi
 
 # Enable device sync at every micro batch execution level only for LLaMa 3.1 8B scenario
 if [[ "${LLAMA_VER}" = "3.1" ]] && [[ "${LLAMA_MODEL_SIZE}" = "8" ]] && [[ ${DP} = 8 ]] && [[ $((NUM_NODES*DEVICES_PER_NODE)) = 8 ]]; then
@@ -442,12 +496,21 @@ if [[ "${TRANSFORMER_IMPL}" = "transformer_engine" && "${FP8}" -eq 1 ]]; then
     CMD="${CMD} --fp8-format ${FP8_FORMAT}"
     CMD="${CMD} --fp8-coverage ${FP8_COVERAGE}"
 
+    # # Add combined LLAMA_VERSION and MODEL_SIZE if both exist
+    if [[ -n "${LLAMA_VER}" && -n "${LLAMA_MODEL_SIZE}" ]]; then
+        CMD="${CMD} --model-name llama${LLAMA_VER}-${LLAMA_MODEL_SIZE}b"
+    fi
+
     if [[ "${FP8_AMAX_REDUCE}" -eq 1 ]]; then
         CMD="${CMD} --fp8-amax-reduce"
     fi
 
     CMD="${CMD} --cache-fp8-weight ${CACHE_FP8_WEIGHT}"
     CMD="${CMD} --cache-fp8-weight-fwd ${CACHE_FP8_WEIGHT_FWD}"
+
+    if [[ "${FP8_SMOOTH_SWIGLU}" -eq 1 ]]; then
+        CMD="${CMD} --fp8-smooth-swiglu"
+    fi
 
 fi
 
@@ -457,6 +520,8 @@ if [[ -n "${KILL_SWITCH_FILE}" ]]; then
 fi
 
 if [[ -n "${PROFILE_TYPE}" ]]; then
+    CMD="${CMD} --profile"
+    CMD="${CMD} --use-pytorch-profiler"
     CMD="${CMD} --profile-type ${PROFILE_TYPE}"
     CMD="${CMD} --profile-step-start ${PROFILE_STEP_START}"
     CMD="${CMD} --profile-step-end ${PROFILE_STEP_END}"
@@ -471,6 +536,14 @@ if [[ "${CHECKPOINT_SAVE}" -eq 1 ]]; then
         CMD="${CMD} --verify-checkpoint"
         CMD="${CMD} --verify-checkpoint-model-type LLAMA"
     fi
+fi
+
+if [[ ${NO_LOAD_OPTIM} -eq 1 ]]; then
+    CMD="${CMD} --no-load-optim"
+fi
+
+if [[ ${NO_LOAD_RNG} -eq 1 ]]; then
+    CMD="${CMD} --no-load-rng"
 fi
 
 if [[ "${TOKENIZER_TYPE}" = "GPTSentencePieceTokenizer" || "${TOKENIZER_TYPE}" = "HuggingFaceTokenizer" ]]; then

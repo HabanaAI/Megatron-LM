@@ -109,9 +109,7 @@ def reduce_aux_losses_tracker_across_ranks(tracker: dict):
             torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
-                values,
-                group=tracker[name]['avg_group'],
-                op=torch.distributed.ReduceOp.AVG,
+                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
 
 

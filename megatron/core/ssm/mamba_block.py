@@ -1,6 +1,6 @@
+# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
 # This source code is licensed under the Apache license found in the
@@ -16,7 +16,19 @@ from torch import Tensor, nn
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.extensions.transformer_engine import TENorm
+
+try:
+    from megatron.core.extensions.transformer_engine import TENorm
+
+    HAVE_TE = True
+except:
+    HAVE_TE = False
+
+try:
+    from megatron.core.extensions.intel_transformer_engine import IntelTENorm
+except:
+    pass
+
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -168,7 +180,7 @@ class MambaStack(MegatronModule):
                 # Transformer layers apply their own pp_layer_offset
                 layer = build_module(submodules.mlp_layer, config=self.config, layer_number=i + 1)
             else:
-                assert True, "unexpected layer_type"
+                assert False, "unexpected layer_type"
             self.layers.append(layer)
 
         # Required for activation recomputation
@@ -176,7 +188,8 @@ class MambaStack(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_norm = TENorm(
+            norm_cls = TENorm if HAVE_TE else IntelTENorm
+            self.final_norm = norm_cls(
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,

@@ -1,4 +1,3 @@
-# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import json
@@ -184,7 +183,6 @@ def gpt2_merge(odir):
     return path
 
 
-# @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
 
@@ -215,7 +213,8 @@ def bert_vocab(odir):
     return path
 
 
-@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:
 

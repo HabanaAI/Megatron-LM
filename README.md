@@ -25,7 +25,7 @@ Megatron-Core offers core building blocks such as attention mechanisms, transfor
 
 
 ## How to Use
-Users bear sole liability and responsibility to follow and comply with any third party licenses, and Habana Labs disclaims and will bear no liability with respect to users’ use or compliance with third party licenses.
+Users bear sole liability and responsibility to follow and comply with any third party licenses, and Intel Corporation disclaims and will bear no liability with respect to users’ use or compliance with third party licenses.
 * Third-Party Models
   * In the course of using Megatron-LM, users may choose to download models created and distributed by third parties after reviewing background information about the models and agreeing to the license governing those models.
   * Notice: Intel does not create the content and does not warrant its accuracy or quality. By accessing the third-party content, or using materials trained on or with such content, you are indicating your acceptance of the terms associated with that content and warranting that your use complies with the applicable license.
@@ -78,17 +78,20 @@ export PYTHONPATH=$MEGATRON_LM_ROOT:$PYTHONPATH
 # Supported Configurations
 | Model                                       | Mode        | Intel Gaudi software Version | PyTorch Version | Validated on Gaudi 2 | Validated on Gaudi 3 |
 | --------------------------------------------| ----------- | ---------------------------- | --------------- | -------------------- | -------------------- |
-| [LLaMA 3.1](examples/llama/README.md)       | Pretraining | 1.20.1                       | 2.6.0           | :heavy_check_mark:   | :heavy_check_mark:*  |
-| [Mixtral 8x7B](examples/mixtral/README.md)  | Pretraining | 1.20.1                       | 2.6.0           | :heavy_check_mark:** |                      |
+| [LLaMA 3.1](examples/llama/README.md)       | Pretraining | 1.21.0                       | 2.6.0           | :heavy_check_mark:   | :heavy_check_mark:*  |
+| [Mixtral 8x7B](examples/mixtral/README.md)  | Pretraining | 1.21.0                       | 2.6.0           | :heavy_check_mark:** |                      |
 
 *Sporadic numerical instability can occur when training with fp8 precision.
 
 **Only BF16 configurations are currently enabled.
 
 # Changelog
-## 1.20.1
-- Enabled Dynamic MoE computation on HPU with `IntelDynamicMLP` which supports bf16 and fp32 precision. Token routing inside the EP/TP group and reductions in and between groups are internalized within the fused MoE kernel, which speeds up training and improves token balancing by minimizing padding. No tokens are dropped. DP/TP/EP/PP/SP modes are supported.
+## 1.21.0
+- Rebased code to upstream [core_r0.10.0](https://github.com/NVIDIA/Megatron-LM/tree/core_r0.10.0) release.
 - Added different levels of memory optimization for exporting or loading distributed optimizer states, controlled via an argument.
+- Added mpirun core affinity settings support for LLaMA & Mixtral examples using `HL_PE` and `HL_PPR`.
+- Enabled Dynamic MoE computation on HPU with `IntelDynamicMLP` which supports bf16 and fp32 precision. Token routing inside the EP/TP group and reductions in and between groups are internalized within the fused MoE kernel, which speeds up training and improves token balancing by minimizing padding. No tokens are dropped. DP/TP/EP/PP/SP modes are supported.
+- Added support for Context Parallelism through Intel Transformer Engine with BF16 data type.
 
 ## 1.20.0
 - Changed the default behavior of "accumulate_allreduce_grads_in_fp32" for the bfloat16 data type. Instead of performing gradient accumulation and all-reduce in fp32, it is sufficient to do so in bfloat16 for some configurations. However, for configurations where Gradient Accumulutation Steps * data parallel size > 256, switching to fp32 is necessary.
@@ -116,4 +119,5 @@ Major changes done to the original code from [NVIDIA/Megatron-LM](https://github
 
 # Known Issues
 * Only recipes mentioned in this README are supported and verified.
-* Gaudi 3 scale out configurations can exhibit performance fluctuations.
+* For certain configurations, if the first run of a workload may show lower performance, recommended to stop and restart the run.
+* Minor variations may be visible in the performance metrics reported every step, expected to stabilize over time.

@@ -17,9 +17,13 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.rmsnorm import RMSNorm
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import BaseTransformerLayer
+from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import is_real_cuda_device_available, make_viewless_tensor
+from megatron.core.utils import (
+    is_real_cuda_device_available,
+    is_te_min_version,
+    make_viewless_tensor,
+)
 
 try:
     from megatron.core.extensions.intel_transformer_engine import IntelTEDelayedScaling
@@ -46,9 +50,9 @@ except ImportError:
         LayerNormImpl = FusedLayerNorm
 
     except ImportError:
-        from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+        from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-        LayerNormImpl = WrappedTorchLayerNorm
+        LayerNormImpl = WrappedTorchNorm
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
@@ -201,6 +205,8 @@ class TransformerBlock(MegatronModule):
         # Item `i` in the dictionary is a list of `N` CUDA graphs for layer 'i' where N is the
         # number of microbatches. Multiple CUDA graphs per layer is required to support
         # pipelining which requires running FWD graph of multiple microbatches before BWD graph.
+        # To enable CUDA graph, this dictionary should be populated in the model training script
+        # with the graphs returned by make_graphed_callables API before the first trainng step.
         self.cuda_graphs = {}
         self.current_microbatch = -1
 
@@ -275,6 +281,7 @@ class TransformerBlock(MegatronModule):
         context: Tensor,
         context_mask: Tensor,
         rotary_pos_emb: Tensor,
+        attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
     ):
         """Forward method with activation checkpointing."""
@@ -296,6 +303,7 @@ class TransformerBlock(MegatronModule):
                         context=context,
                         context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,
+                        attention_bias=attention_bias,
                         inference_params=None,
                         packed_seq_params=packed_seq_params,
                     )
@@ -304,6 +312,7 @@ class TransformerBlock(MegatronModule):
             return custom_forward
 
         def checkpoint_handler(forward_func):
+            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             if self.config.fp8:
                 if not is_real_cuda_device_available():
                     from intel_transformer_engine.distributed import checkpoint as te_checkpoint
@@ -382,6 +391,36 @@ class TransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    def get_cuda_graph_optional_args(
+        self,
+        attention_mask: Tensor,
+        context: Tensor,
+        context_mask: Tensor,
+        rotary_pos_emb: Tensor,
+        attention_bias: Tensor,
+        inference_params: InferenceParams,
+        packed_seq_params: PackedSeqParams,
+    ):
+        """Get optional tensor arguments for CUDA graph."""
+
+        optional_inputs = {}
+        optional_inputs['is_first_microbatch'] = self.current_microbatch == 0
+        try:
+            import transformer_engine.pytorch as te  # pylint: disable=unused-import
+
+            if is_te_min_version("1.10.0", check_equality=False):
+                assert not any(
+                    [attention_mask, context, context_mask, rotary_pos_emb]
+                ), "Keyword Arguments not supported with CUDA graph."
+            else:
+                optional_inputs['attention_mask'] = attention_mask
+                optional_inputs['context'] = context
+                optional_inputs['context_mask'] = context_mask
+                optional_inputs['rotary_pos_emb'] = rotary_pos_emb
+        except ImportError:
+            raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
+        return optional_inputs
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -389,6 +428,9 @@ class TransformerBlock(MegatronModule):
         context: Tensor = None,
         context_mask: Tensor = None,
         rotary_pos_emb: Tensor = None,
+        rotary_pos_cos: Tensor = None,
+        rotary_pos_sin: Tensor = None,
+        attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
     ):
@@ -406,6 +448,9 @@ class TransformerBlock(MegatronModule):
             context (Tensor, optional): Context tensor for cross-attention.
             context_mask (Tensor, optional): Mask for cross-attention context
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            attention_bias (Tensor): Bias tensor for Q * K.T of shape in shape broadcastable
+                to [b, num_head, sq, skv], e.g. [1, 1, sq, skv].
+                Used as an alternative to apply attention mask for TE cuDNN attention.
             inference_params (InferenceParams, optional): Parameters for inference-time
                 optimizations.
             packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
@@ -502,6 +547,7 @@ class TransformerBlock(MegatronModule):
                     context=context,
                     context_mask=context_mask,
                     rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                 )
             else:
@@ -515,21 +561,34 @@ class TransformerBlock(MegatronModule):
                                 context=context,
                                 context_mask=context_mask,
                                 rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                attention_bias=attention_bias,
                                 inference_params=inference_params,
                                 packed_seq_params=packed_seq_params,
                             )
                         else:
                             # CUDA graph replay for layer `l_no` and microbatch
-                            # `self.current_microbatch`
-                            # CUDA graph requires positional arguments with the exception
-                            # of is_first_microbatch.
-                            # Also CUDA graph accepts only Tensor inputs and outputs.
-                            # Hence, the arg list and returned list is limited to `hidden_states`.
-                            assert (len(self.cuda_graphs) > l_no) and (
-                                self.current_microbatch < len(self.cuda_graphs[l_no])
+                            # `self.current_microbatch`. TransformerEngine versions>=1.10
+                            # allow keyword arguments with CUDA graph. However, CUDA graph
+                            # acccepts only Tensor inputs and Tensor outputs. Hence,
+                            # `inference_params` and `packed_seq_params` are excluded from
+                            # input list while output is limited to `hidden_states`.
+                            cg_index = self.current_microbatch % len(self.cuda_graphs[l_no])
+                            assert not any(
+                                [inference_params, packed_seq_params]
+                            ), "CUDA graph accepts only Tensor inputs."
+                            optional_inputs = self.get_cuda_graph_optional_args(
+                                attention_mask,
+                                context,
+                                context_mask,
+                                rotary_pos_emb,
+                                attention_bias,
+                                inference_params,
+                                packed_seq_params,
                             )
-                            hidden_states = self.cuda_graphs[l_no][self.current_microbatch](
-                                hidden_states, is_first_microbatch=(self.current_microbatch == 0)
+                            hidden_states = self.cuda_graphs[l_no][cg_index](
+                                hidden_states, **optional_inputs
                             )
 
                     if (
@@ -571,12 +630,18 @@ class TransformerBlock(MegatronModule):
         non_homogeneous_layers = metadata is not None and metadata.get(
             'non_homogeneous_layers', False
         )
+        if isinstance(self.config.moe_layer_freq, int):
+            if self.config.moe_layer_freq > 1:
+                non_homogeneous_layers = True
+        elif isinstance(self.config.moe_layer_freq, list):
+            non_homogeneous_layers = True
+
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
         num_layers = self.config.num_layers
         for layer in self.layers:
-            offset = layer._get_layer_offset()
+            offset = TransformerLayer._get_layer_offset(self.config)
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long

@@ -13,7 +13,7 @@ if [[ $GIT_MAJOR -eq 2 && $GIT_MINOR -lt 31 ]]; then
     exit 1
 fi
 
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 CHECK_ONLY=${CHECK_ONLY:-false}
 SKIP_DOCS=${SKIP_DOCS:-false}
 
@@ -21,12 +21,10 @@ export BASE_REF='master_next'
 if [ ! -z ${GIT_TARGET_BRANCH} ]; then
     BASE_REF="${GIT_TARGET_BRANCH}"
 fi
-
-CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base $(git remote)/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
+CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
 ADDITIONAL_ARGS=""
 ADDITIONAL_BLACK_ARGS=""
 ADDITIONAL_PYLINT_ARGS=""
-
 
 if [[ $CHECK_ONLY == true ]]; then
     ADDITIONAL_ARGS="--check"
@@ -40,7 +38,8 @@ fi
 if [[ -n "$CHANGED_FILES" ]]; then
     black --skip-magic-trailing-comma $ADDITIONAL_ARGS $ADDITIONAL_BLACK_ARGS --verbose $CHANGED_FILES
     isort $ADDITIONAL_ARGS $CHANGED_FILES
-    #pylint $ADDITIONAL_PYLINT_ARGS $CHANGED_FILES
+    # pylint $ADDITIONAL_PYLINT_ARGS $CHANGED_FILES
+    # mypy --explicit-package-bases --follow-imports=skip $CHANGED_FILES || true
 else
     echo Changeset is empty, all good.
 fi

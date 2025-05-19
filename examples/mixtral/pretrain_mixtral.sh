@@ -30,8 +30,7 @@ PP=${HL_PP:-1}
 CP=${HL_CP:-1}
 MOE_EP=${HL_MOE_EP:-}
 MOE_TP=${HL_MOE_TP:-}
-SEQ_PARALLEL=${HL_SEQ_PARALLEL:-0}
-TOKEN_DISPATCHER_TYPE=${HL_TOKEN_DISPATCHER_TYPE:-alltoall}
+SEQ_PARALLEL=${HL_SEQ_PARALLEL:-1}
 HOSTSFILE=${HL_HOSTSFILE:-}
 KILL_SWITCH_FILE=${HL_KILL_SWITCH:-}
 DIST_OPTIMIZER=${HL_DIST_OPTIMIZER:-0}
@@ -54,15 +53,16 @@ MOE_TOKEN_DISTRIBUTION_LOGGING=${HL_MOE_TOKEN_DISTRIBUTION_LOGGING:-0}
 MOE_TOKEN_DISTRIBUTION_LOGGING_INTERVAL=${HL_MOE_TOKEN_DISTRIBUTION_LOGGING_INTERVAL:-50}
 MOE_ROUTER_PRE_SOFTMAX=${HL_MOE_ROUTER_PRE_SOFTMAX:-1}
 MOE_ROUTER_FP32=${HL_MOE_ROUTER_FP32:-1}
+MOE_TOKEN_DISPATCHER_TYPE=${HL_TOKEN_DISPATCHER_TYPE:-alltoall}
+MOE_LOAD_BALANCING_TYPE=${HL_MOE_LOAD_BALANCING_TYPE:-aux_loss}
 
 # Dynamic MOE with IntelDynamicMLP
-MOE_DYNAMIC=${HL_MOE_DYNAMIC:-1} # Default for HPU
+MOE_DYNAMIC=${HL_MOE_DYNAMIC:-0} # Default for HPU
 MOE_PERMUTED_WEIGHTS=${HL_MOE_PERMUTED_WEIGHTS:-1}
 MOE_FUSED_WEIGHTS=${HL_MOE_FUSED_WEIGHTS:-1}
 
 # Capacity Bins with SequentialMLP
-MOE_NUM_CAPACITY_BINS=${HL_MOE_NUM_CAPACITY_BINS:-0} # 10 is default for 32k Sequence Length
-MOE_CAPACITY_BINS=${HL_MOE_CAPACITY_BINS:-}
+MOE_NUM_CAPACITY_BINS=${HL_MOE_NUM_CAPACITY_BINS:-10} # 10 is default for 32k Sequence Length
 MOE_CAPACITY_BINS_EXP_BASE=${HL_MOE_CAPACITY_BINS_EXP_BASE:-1.5}
 MOE_CAPACITY_BINS_ALIGNMENT=${HL_MOE_CAPACITY_BINS_ALIGNMENT:-64}
 MOE_CAPACITY_BINS_OPTIMIZE_INTERVAL=${HL_MOE_CAPACITY_BINS_OPTIMIZE_INTERVAL:-300}
@@ -72,6 +72,7 @@ MOE_CAPACITY_BINS_MAX_OVERHEAD_FACTOR=${HL_MOE_CAPACITY_BINS_MAX_OVERHEAD_FACTOR
 USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
 USE_TORCH_COMPILE=${HL_USE_TORCH_COMPILE:-0}
 USE_TORCH_COMPILED_AUTOGRAD=${HL_USE_TORCH_COMPILED_AUTOGRAD:-0}
+TORCH_COMPILE_DISABLE=${HL_TORCH_COMPILE_DISABLE:-0}
 
 USE_FUSED_SDPA=${HL_USE_FUSED_SDPA:-1}
 USE_FUSED_SDPA_WITH_RECOMPUTE=${HL_USE_FUSED_SDPA_WITH_RECOMPUTE:-0}
@@ -101,9 +102,10 @@ EXIT_INTERVAL=${HL_EXIT_INTERVAL:-0}
 SAVE_DISTRIB_OPTIMIZER_METHOD=${HL_SAVE_DISTRIB_OPTIMIZER_METHOD:-parallel_multi_node}
 LOAD_DISTRIB_OPTIMIZER_METHOD=${HL_LOAD_DISTRIB_OPTIMIZER_METHOD:-serial_per_node}
 
-PROFILE_TYPE=${HL_PROFILE_TYPE:-}  # provide either of pt, pt-full, hltv
+PROFILE_TYPE=${HL_PROFILE_TYPE:-}  # provide either of pt, pt-full
 PROFILE_STEP_START=${HL_PROFILE_STEP_START:-3}
 PROFILE_STEP_END=${HL_PROFILE_STEP_END:-4}
+PROFILE_RANKS=${HL_PROFILE_RANKS:-"0"} # "0 1 4 7"
 
 FP8=${HL_FP8:-0}
 BF16=${HL_BF16:-1}
@@ -111,9 +113,11 @@ TRANSFORMER_IMPL=${HL_TRANSFORMER_IMPL:-transformer_engine}
 FP8_FORMAT=${HL_FP8_FORMAT:-hybrid} # hybrid or e5m2
 FP8_MARGIN=${HL_FP8_MARGIN:-0}
 FP8_AMAX_COMPUTE_ALGO=${HL_FP8_AMAX_COMPUTE_ALGO:-max} # max or most_recent
-FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=False attention=True"}
+FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=False"}
+MOE_GROUPED_GEMM=${HL_MOE_GROUPED_GEMM:-0}
 
 NUM_WORKERS=${HL_NUM_WORKERS:-0}
+ENV_FLAGS=${HL_ENV_FLAGS:-} #"a=1,b=2,c=3"
 
 # Following configuration are dependant on specific model definitions, but can
 # be overridden for debug purposes
@@ -169,22 +173,38 @@ if [ -z "${MOE_EP}" ]; then
       MOE_EP=${MOE_NUM_EXPERTS}
   fi
 fi
+# Check valid expert capacity configuration
+if [[ $MOE_DYNAMIC -eq 1 && $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
+    echo "MOE_DYNAMIC=1 and MOE_NUM_CAPACITY_BINS > 0 are mutually exclusive."
+    exit 1
+fi
 
-if [ $MOE_DYNAMIC -eq 1 ]; then
-    if [ $MOE_NUM_CAPACITY_BINS -gt 0 ]; then
-        echo "Dynamic MoE 'IntelDynamicMLP' and Capacity Bins can't be used together. In most scenarions 'IntelDynamicMLP' will perform better."
+if [[ $MOE_DYNAMIC -eq 1 && -n "$MOE_EXPERT_CAPACITY_FACTOR" ]]; then
+    echo "MOE_DYNAMIC=1 and MOE_EXPERT_CAPACITY_FACTOR are mutually exclusive."
+    exit 1
+fi
+
+if [[ $MOE_NUM_CAPACITY_BINS -gt 0 && -n "$MOE_EXPERT_CAPACITY_FACTOR" ]]; then
+    echo "MOE_NUM_CAPACITY_BINS > 0 and MOE_EXPERT_CAPACITY_FACTOR are mutually exclusive."
+    exit 1
+fi
+
+if [[ $MOE_DYNAMIC -eq 1 && $FP8 -eq 1 ]]; then
+        echo "Fused HPU kernel for MoE 'IntelDynamicMLP' supports FP32 and BF16 precision, got HL_FP8=1"
         exit 1
-    fi
-    if [ $FP8 -eq 1 ]; then
-        echo "Dynamic MoE 'IntelDynamicMLP' supports FP32 and BF16 precision, got HL_FP8=1"
-        exit 1
-    fi
+fi
+if [[ $MOE_DYNAMIC -eq 1 ]]; then
+    MOE_PAD_EXPERT_INPUT_TO_CAPACITY=""
+    MOE_TOKEN_DISPATCHER_TYPE=""
 fi
 
 if [[ $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
-    echo "Using either Capacity Bins. Capacity factor value will be ignored. Token padding is done by default."
-    MOE_EXPERT_CAPACITY_FACTOR=""
     MOE_PAD_EXPERT_INPUT_TO_CAPACITY=1
+    MOE_TOKEN_DISPATCHER_TYPE="alltoall"
+fi
+
+if [[ $MOE_EXPERT_CAPACITY_FACTOR -gt 0 ]]; then
+    MOE_TOKEN_DISPATCHER_TYPE="alltoall"
 fi
 
 if [[ "${USE_FUSED_SDPA}" = "1" || "${USE_FUSED_SDPA_WITH_RECOMPUTE}" = "1" ]]; then
@@ -262,16 +282,28 @@ if [ "$NUM_NODES" -ne "1" -a -z "$HOSTSFILE" ]; then
 fi
 
 PT_HPU_GPU_MIGRATION=1
-CUDA_DEVICE_MAX_CONNECTIONS=1
 CMD=""
 
 if [ "$LAUNCHER_TYPE" = "mpirun" ]; then
     CMD="$CMD mpirun"
     CMD="$CMD --allow-run-as-root"
     CMD="$CMD -n ${NUM_DEVICES}"
-    CMD="$CMD --bind-to none"
+    [[ -n "$HL_PE" ]] && __MAP_BY="socket:PE=${HL_PE}"
+    [[ -n "$HL_PE" ]] && [[ -n "${HL_PPR}" ]] && __MAP_BY="ppr:${HL_PPR}:socket:PE=${HL_PE}"
+    if [[ -n "${__MAP_BY}" ]]; then
+        CMD="${CMD} --bind-to core --rank-by core --report-bindings --map-by ${__MAP_BY}"
+    else
+        CMD="${CMD} --bind-to none"
+    fi
     CMD="$CMD -x PT_HPU_GPU_MIGRATION=$PT_HPU_GPU_MIGRATION"
-    CMD="$CMD -x CUDA_DEVICE_MAX_CONNECTIONS=$CUDA_DEVICE_MAX_CONNECTIONS"
+    CMD="${CMD} -x PT_HPU_LAZY_MODE=${USE_LAZY_MODE}"
+    if [ "${TORCH_COMPILE_DISABLE}" = "1" ]; then
+        CMD="${CMD} -x TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE}"
+    fi
+    IFS=',' read -ra ENV_FLAGS_ARR <<< "$ENV_FLAGS"
+    for ENV_FLAG in "${ENV_FLAGS_ARR[@]}"; do
+        CMD="${CMD} -x ${ENV_FLAG}"
+    done
     if [ "$NUM_NODES" -ne "1" ]; then
         CMD="$CMD -hostfile $HOSTSFILE"
         CMD="$CMD -x MASTER_ADDR=$(head -n 1 $HOSTSFILE | sed -n s/[[:space:]]slots.*//p)"
@@ -285,7 +317,14 @@ elif [ "$LAUNCHER_TYPE" = "torchrun" ]; then
         exit 1
     fi
     export PT_HPU_GPU_MIGRATION=$PT_HPU_GPU_MIGRATION
-    export CUDA_DEVICE_MAX_CONNECTIONS=$CUDA_DEVICE_MAX_CONNECTIONS
+    export PT_HPU_LAZY_MODE=${USE_LAZY_MODE}
+    if [ "${TORCH_COMPILE_DISABLE}" = "1" ]; then
+        export TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE}
+    fi
+    IFS=',' read -ra ENV_FLAGS_ARR <<< "$ENV_FLAGS"
+    for ENV_FLAG in "${ENV_FLAGS_ARR[@]}"; do
+        export "${ENV_FLAG?}"
+    done
     CMD="$CMD torchrun"
     CMD="$CMD --nnodes $NUM_NODES"
     CMD="$CMD --nproc-per-node $DEVICES_PER_NODE"
@@ -299,11 +338,6 @@ else
 fi
 
 # training script command
-
-if [ $USE_LAZY_MODE -eq 0 ]; then
-    CMD="${CMD} -x PT_HPU_LAZY_MODE=0"
-fi
-
 MLM_SCRIPT="${MEGATRON_LM_ROOT}/pretrain_gpt.py"
 
 CMD="${CMD} \
@@ -363,12 +397,19 @@ CMD="${CMD} \
     --log-timers-to-tensorboard \
     --num-workers ${NUM_WORKERS} \
     --use-fast-softmax ${USE_FAST_SOFTMAX} \
+    --distributed-timeout-minutes 60 \
     "
 
 # -------------
 # Precision fp32->bf16
 if [ $BF16 -eq 1 ]; then
     CMD="${CMD} --bf16"
+fi
+
+# -------------
+# GroupedMLP
+if [ "$MOE_GROUPED_GEMM" -eq 1 ] || [ "$FP8" -eq 1 ]; then
+    CMD="${CMD} --moe-grouped-gemm"
 fi
 
 # -------------
@@ -392,11 +433,6 @@ if [ $MOE_DYNAMIC -eq 1 ]; then
     if [ $MOE_FUSED_WEIGHTS -eq 1 ]; then
         CMD="${CMD} --moe-fused-weights"
     fi
-    echo "While using Dynamic MoE HPU Kernel - IntelDynamicMLP capacity settings and padding are set to None!"
-    MOE_NUM_CAPACITY_BINS=0
-    MOE_PAD_EXPERT_INPUT_TO_CAPACITY=""
-    MOE_EXPERT_CAPACITY_FACTOR=""
-    MOE_TOKEN_DISPATCHER_TYPE=""
 fi
 
 # MoE Capacity Bins arguments
@@ -408,14 +444,16 @@ if [[ $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
     CMD="${CMD} --moe-capacity-bins-optimize-interval ${MOE_CAPACITY_BINS_OPTIMIZE_INTERVAL}"
     CMD="${CMD} --moe-capacity-bins-optimize-max-group ${MOE_CAPACITY_BINS_OPTIMIZE_MAX_GROUP}"
     CMD="${CMD} --moe-capacity-bins-max-overhead-factor ${MOE_CAPACITY_BINS_MAX_OVERHEAD_FACTOR}"
+
 fi
 
 CMD="${CMD} --num-experts ${MOE_NUM_EXPERTS}"
 CMD="${CMD} --moe-router-topk ${MOE_TOPK}"
-CMD="${CMD} --moe-router-load-balancing-type aux_loss"
+CMD="${CMD} --moe-router-load-balancing-type ${MOE_LOAD_BALANCING_TYPE}"
 CMD="${CMD} --moe-aux-loss-coeff ${MOE_AUX_LOSS_COEFF}"
-CMD="${CMD} --moe-token-dispatcher-type ${TOKEN_DISPATCHER_TYPE}"
-
+if [ -n "$MOE_TOKEN_DISPATCHER_TYPE" ]; then
+    CMD="${CMD} --moe-token-dispatcher-type ${MOE_TOKEN_DISPATCHER_TYPE}"
+fi
 if [ -n "$MOE_ZLOSS_COEFF" ]; then
     CMD="${CMD} --moe-z-loss-coeff ${MOE_ZLOSS_COEFF}"
 fi
@@ -438,13 +476,16 @@ if [ $MOE_PAD_EXPERT_INPUT_TO_CAPACITY -eq 1 ]; then
 fi
 
 # Additonal arguments
+if [[ "${USE_FUSED_SDPA}" = "1" || "${USE_FUSED_SDPA_WITH_RECOMPUTE}" = "1" ]]; then
+    CMD="${CMD} --no-create-attention-mask-in-dataloader"
+fi
 
 if [ $SEQ_PARALLEL -eq 1 ]; then
     CMD="${CMD} --sequence-parallel"
 fi
 
 if [ $MOE_TP -eq 1 ]; then
-    CMD="${CMD} --moe-extended-tp"
+    CMD="${CMD} --expert-tensor-parallel-size ${TP}"
 fi
 
 if [ $CKP_ACT -eq 1 ]; then
@@ -473,9 +514,12 @@ if [ ! -z "$KILL_SWITCH_FILE" ]; then
 fi
 
 if [ ! -z "$PROFILE_TYPE" ]; then
+    CMD="${CMD} --profile"
+    CMD="${CMD} --use-pytorch-profiler"
     CMD="${CMD} --profile-type ${PROFILE_TYPE}"
     CMD="${CMD} --profile-step-start ${PROFILE_STEP_START}"
     CMD="${CMD} --profile-step-end ${PROFILE_STEP_END}"
+    CMD="${CMD} --profile-ranks ${PROFILE_RANKS}"
 fi
 
 if [ $CHECKPOINT_SAVE -eq 1 ]; then

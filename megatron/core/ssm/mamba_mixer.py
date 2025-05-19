@@ -1,6 +1,6 @@
+# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
 # This source code is licensed under the Apache license found in the
@@ -25,6 +25,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import is_real_cuda_device_available
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -44,7 +45,10 @@ try:
         mamba_split_conv1d_scan_combined,
     )
 except ImportError:
-    raise ImportError("mamba-ssm is required by the Mamba model but cannot be imported")
+    if is_real_cuda_device_available():
+        raise ImportError("mamba-ssm is required by the Mamba model but cannot be imported")
+    else:
+        print("mamba-ssm is required by the Mamba model but cannot be imported")
 
 try:
     from einops import rearrange, repeat
@@ -52,17 +56,19 @@ except ImportError:
     raise ImportError("einops is required by the Mamba model but cannot be imported")
 
 
-class ExtendedRMSNorm(RMSNormGated):
-    """
-    RMSNormGated with sharded state dict.
-    """
+if is_real_cuda_device_available():
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """Sharding along axis 0, bias not sharded"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'weight': 0}, sharded_offsets
-        )
+    class ExtendedRMSNorm(RMSNormGated):
+        """
+        RMSNormGated with sharded state dict.
+        """
+
+        def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+            """Sharding along axis 0, bias not sharded"""
+            state_dict = self.state_dict(prefix='', keep_vars=True)
+            return make_sharded_tensors_for_checkpoint(
+                state_dict, prefix, {'weight': 0}, sharded_offsets
+            )
 
 
 @dataclass
@@ -580,6 +586,7 @@ class MambaMixer(MegatronModule):
         return conv_state, ssm_state
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Provide a sharded state dictionary for distributed checkpointing."""
         sharded_state_dict = {}
         # Parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)

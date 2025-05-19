@@ -16,6 +16,7 @@ test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
+@pytest.mark.flaky_in_dev
 def test_initialize_and_destroy_model_parallel(order):
     with pytest.raises(AssertionError):
         assert ps.initialize_model_parallel(order=order)
@@ -43,7 +44,12 @@ def test_initialize_and_destroy_model_parallel(order):
     assert ps.get_tensor_model_parallel_group() is not None
     assert ps.get_pipeline_model_parallel_group() is not None
     assert ps.get_data_parallel_group() is not None
+    assert ps.get_expert_model_parallel_group() is not None
+    assert ps.get_expert_tensor_parallel_group() is not None
+    assert ps.get_expert_data_parallel_group() is not None
+    assert ps.get_expert_tensor_model_pipeline_parallel_group() is not None
     assert ps.get_all_data_parallel_ranks() is not None
+    assert ps.get_all_data_parallel_ranks(True) is not None
     Utils.destroy_model_parallel()
     assert ps._MODEL_PARALLEL_GROUP is None
 
@@ -79,6 +85,15 @@ def test_tensor_model_parellel_world_size(order):
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
+def test_expert_tensor_parellel_world_size(order):
+    Utils.initialize_model_parallel(expert_tensor_parallel_size=world_size, order=order)
+    assert ps.get_expert_tensor_parallel_world_size() == world_size
+    ps.set_expert_tensor_parallel_world_size(None)
+    assert ps.get_expert_tensor_parallel_world_size() == world_size
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize('order', test_parallel_order)
 def test_pipeline_model_parallel_world_size(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
     assert ps.get_pipeline_model_parallel_world_size() == world_size
@@ -93,6 +108,15 @@ def test_tensor_model_parallel_rank(order):
     assert ps.get_tensor_model_parallel_rank() == rank
     ps.set_tensor_model_parallel_rank(None)
     assert ps.get_tensor_model_parallel_rank() == rank
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize('order', test_parallel_order)
+def test_moe_tensor_model_parellel_rank(order):
+    Utils.initialize_model_parallel(expert_tensor_parallel_size=world_size, order=order)
+    assert ps.get_expert_tensor_parallel_rank() == rank
+    ps.set_expert_tensor_parallel_rank(None)
+    assert ps.get_expert_tensor_parallel_rank() == rank
     Utils.destroy_model_parallel()
 
 
@@ -197,16 +221,17 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     tp_g = torch.distributed.get_process_group_ranks(ps.get_tensor_model_parallel_group())
     dp_g = torch.distributed.get_process_group_ranks(ps.get_data_parallel_group(False))
     pp_g = torch.distributed.get_process_group_ranks(ps.get_pipeline_model_parallel_group())
-    dp_no_ep_g = torch.distributed.get_process_group_ranks(
-        ps.get_data_modulo_expert_parallel_group()
-    )
+    dp_no_ep_g = torch.distributed.get_process_group_ranks(ps.get_expert_data_parallel_group())
     cp_g = torch.distributed.get_process_group_ranks(ps.get_context_parallel_group())
     mp_g = torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
-    tp_ep_g = torch.distributed.get_process_group_ranks(ps.get_tensor_and_expert_parallel_group())
+    tp_ep_g = torch.distributed.get_process_group_ranks(
+        ps.get_expert_tensor_and_model_parallel_group()
+    )
     tp_dp_g = torch.distributed.get_process_group_ranks(
         ps.get_tensor_and_data_parallel_group(False)
     )
     all_dp_ranks = ps.get_all_data_parallel_ranks()
+    all_dp_ranks_with_cp = ps.get_all_data_parallel_ranks(True)
 
     Utils.destroy_model_parallel()
 
@@ -222,17 +247,18 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     assert dp_g == torch.distributed.get_process_group_ranks(ps.get_data_parallel_group(False))
     assert pp_g == torch.distributed.get_process_group_ranks(ps.get_pipeline_model_parallel_group())
     assert dp_no_ep_g == torch.distributed.get_process_group_ranks(
-        ps.get_data_modulo_expert_parallel_group()
+        ps.get_expert_data_parallel_group()
     )
     assert cp_g == torch.distributed.get_process_group_ranks(ps.get_context_parallel_group())
     assert mp_g == torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
     assert tp_ep_g == torch.distributed.get_process_group_ranks(
-        ps.get_tensor_and_expert_parallel_group()
+        ps.get_expert_tensor_and_model_parallel_group()
     )
     assert tp_dp_g == torch.distributed.get_process_group_ranks(
         ps.get_tensor_and_data_parallel_group(False)
     )
     assert all_dp_ranks == ps.get_all_data_parallel_ranks()
+    assert all_dp_ranks_with_cp == ps.get_all_data_parallel_ranks(True)
 
     Utils.destroy_model_parallel()
 
@@ -241,6 +267,8 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     'src_tp_pp, ep_size',
     [((1, 2), 1), ((1, 4), 1), ((2, 2), 1), ((1, 2), 2), ((1, 4), 2), ((2, 2), 2)],
 )
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     Utils.initialize_model_parallel(
         *src_tp_pp, expert_model_parallel_size=ep_size, order='tp-ep-dp-pp'
@@ -253,6 +281,7 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     amax_g = torch.distributed.get_process_group_ranks(ps.get_amax_reduction_group(False))
     mp_g = torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
     all_dp_ranks = ps.get_all_data_parallel_ranks()
+    all_dp_ranks_with_cp = ps.get_all_data_parallel_ranks(True)
 
     Utils.destroy_model_parallel()
 
@@ -266,6 +295,7 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     assert amax_g != torch.distributed.get_process_group_ranks(ps.get_amax_reduction_group(False))
     assert mp_g != torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
     assert all_dp_ranks != ps.get_all_data_parallel_ranks()
+    assert all_dp_ranks_with_cp != ps.get_all_data_parallel_ranks(True)
 
     Utils.destroy_model_parallel()
 
@@ -399,54 +429,37 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
                     ranks = ranks + list(range(start_rank, end_rank))
                 tp_dp_group.append(list(ranks))
 
-        tp_ep_group = []
-        dp_no_ep_group = []
-        dp_no_ep_group_with_cp = []
+        expert_tp_ep_group = []
+        expert_dp_group = []
 
+        expert_data_parallel_size = world_size // (
+            tensor_model_parallel_size * pipeline_model_parallel_size * expert_model_parallel_size
+        )
         all_ranks = torch.arange(world_size).reshape(
             (
                 pipeline_model_parallel_size,
-                data_parallel_size // expert_model_parallel_size,
+                expert_data_parallel_size,
                 expert_model_parallel_size,
-                context_parallel_size,
                 tensor_model_parallel_size,
             )
         )
-        # 'pp edp ep cp tp -> (pp edp cp) (ep tp)'
-        tp_ep_rearrange = torch.transpose(all_ranks, 2, 3)
+        # (pp, dp, ep, tp) -> (pp*dp, ep*tp)
         tp_ep_rearrange = torch.reshape(
-            tp_ep_rearrange, (-1, expert_model_parallel_size * tensor_model_parallel_size)
+            all_ranks, (-1, expert_model_parallel_size * tensor_model_parallel_size)
         )
-        tp_ep_rearrange = tp_ep_rearrange.tolist()
-        tp_ep_rearrange.sort()
-        for tensor_and_expert_parallel_ranks in tp_ep_rearrange:
-            tensor_and_expert_parallel_ranks = list(tensor_and_expert_parallel_ranks)
-            tensor_and_expert_parallel_ranks.sort()
-            tp_ep_group.append(tensor_and_expert_parallel_ranks)
-        # 'pp edp ep cp tp -> (pp ep cp tp) edp'
-        edp_rearrange = torch.transpose(all_ranks, 1, 4)
-        edp_rearrange = torch.reshape(
-            edp_rearrange, (-1, data_parallel_size // expert_model_parallel_size)
+        num_tp_ep_groups = tp_ep_rearrange.shape[0]
+        for i in range(num_tp_ep_groups):
+            expert_tensor_and_model_parallel_ranks = tp_ep_rearrange[i].tolist()
+            expert_tp_ep_group.append(expert_tensor_and_model_parallel_ranks)
+
+        # (pp, dp, ep, tp) -> (pp*ep*tp, dp)
+        expert_dp_rearrange = torch.permute(all_ranks, (0, 2, 3, 1)).reshape(
+            -1, expert_data_parallel_size
         )
-        edp_rearrange = edp_rearrange.tolist()
-        edp_rearrange.sort()
-        for expert_data_parallel_ranks in edp_rearrange:
-            expert_data_parallel_ranks = list(expert_data_parallel_ranks)
-            expert_data_parallel_ranks.sort()
-            dp_no_ep_group.append(expert_data_parallel_ranks)
-        # 'pp edp ep cp tp -> (pp ep tp) (cp edp)'
-        edp_cp_rearrange = torch.transpose(all_ranks, 1, 2)
-        edp_cp_rearrange = torch.transpose(edp_cp_rearrange, 2, 4)
-        edp_cp_rearrange = torch.reshape(
-            edp_cp_rearrange,
-            (-1, context_parallel_size * data_parallel_size // expert_model_parallel_size),
-        )
-        edp_cp_rearrange = edp_cp_rearrange.tolist()
-        edp_cp_rearrange.sort()
-        for expert_data_parallel_ranksj_with_cp in edp_cp_rearrange:
-            expert_data_parallel_ranksj_with_cp = list(expert_data_parallel_ranksj_with_cp)
-            expert_data_parallel_ranksj_with_cp.sort()
-            dp_no_ep_group_with_cp.append(expert_data_parallel_ranksj_with_cp)
+        num_expert_dp_groups = world_size // expert_data_parallel_size
+        for i in range(num_expert_dp_groups):
+            expert_dp_ranks = expert_dp_rearrange[i].tolist()
+            expert_dp_group.append(expert_dp_ranks)
 
         return (
             dp_groups,
@@ -457,13 +470,13 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
             pp_group,
             tp_dp_group,
             tp_dp_cp_group,
-            tp_ep_group,
-            dp_no_ep_group,
-            dp_no_ep_group_with_cp,
+            expert_tp_ep_group,
+            expert_dp_group,
         )
 
     world_size = nodes * num_gpu
     dp = world_size // (tp * pp * cp)
+    expert_dp = world_size // (tp * ep * pp)
     assert dp % ep == 0, f"dp size ({dp}) is not divisible by ep {ep} ."
     assert (
         world_size % (tp * pp * cp) == 0
@@ -477,9 +490,8 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
         pp_group,
         tp_dp_group,
         tp_dp_cp_group,
-        tp_ep_group,
-        dp_no_ep_group,
-        dp_no_ep_group_with_cp,
+        expert_tp_ep_group,
+        expert_dp_group,
     ) = golden_rank_result_from_past_code(
         world_size=world_size,
         tensor_model_parallel_size=tp,
@@ -487,7 +499,10 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
         context_parallel_size=cp,
         expert_model_parallel_size=ep,
     )
-    rank_generator = ps.RankGenerator(tp=tp, ep=ep, dp=dp, pp=pp, cp=cp, order="tp-cp-ep-dp-pp")
+    rank_generator = ps.RankGenerator(tp=tp, ep=1, dp=dp, pp=pp, cp=cp, order="tp-cp-dp-pp")
+    expert_rank_generator = ps.RankGenerator(
+        tp=tp, ep=ep, dp=expert_dp, pp=pp, cp=1, order="tp-ep-dp-pp"
+    )
     assert dp_groups == rank_generator.get_ranks(
         "dp"
     ), f"{dp_groups} != {rank_generator.get_ranks('dp')}"
@@ -512,32 +527,34 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     assert tp_dp_cp_group == rank_generator.get_ranks(
         "tp-dp-cp"
     ), f"{tp_dp_cp_group} != {rank_generator.get_ranks('tp-dp-cp')}"
-    assert tp_ep_group == rank_generator.get_ranks(
-        "tp-ep", independent_ep=True
-    ), f"{tp_ep_group} != {rank_generator.get_ranks('tp-ep', independent_ep=True)}."
-    assert dp_no_ep_group == rank_generator.get_ranks(
-        "dp", independent_ep=True
-    ), f"{dp_no_ep_group} != {rank_generator.get_ranks('dp', independent_ep=True)}."
-    assert dp_no_ep_group_with_cp == rank_generator.get_ranks(
-        "dp-cp", independent_ep=True
-    ), f"{dp_no_ep_group_with_cp} != {rank_generator.get_ranks('dp-cp', independent_ep=True)}."
+    assert expert_tp_ep_group == expert_rank_generator.get_ranks(
+        "tp-ep"
+    ), f"{expert_tp_ep_group} != {expert_rank_generator.get_ranks('tp-ep')}."
+    assert expert_dp_group == expert_rank_generator.get_ranks(
+        "dp"
+    ), f"{expert_dp_group} != {expert_rank_generator.get_ranks('dp')}."
 
 
 @pytest.mark.parametrize('tensor_model_parallel_size', [1, 2, 4])
 @pytest.mark.parametrize('pipeline_model_parallel_size', [1, 2, 4])
-def test_get_all_data_parallel_ranks(tensor_model_parallel_size, pipeline_model_parallel_size):
+@pytest.mark.parametrize('context_parallel_size', [1, 2, 4])
+def test_get_all_data_parallel_ranks(
+    tensor_model_parallel_size, pipeline_model_parallel_size, context_parallel_size
+):
 
-    if tensor_model_parallel_size * pipeline_model_parallel_size > 8:
+    if tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size > 8:
         pytest.skip(
-            f"Provided configuration {tensor_model_parallel_size=} and {pipeline_model_parallel_size=} is not supported for 8c. Skipping ..."
+            f"Provided configuration {tensor_model_parallel_size=}, {pipeline_model_parallel_size=} and {context_parallel_size=} is not supported for 8c. Skipping ..."
         )
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tensor_model_parallel_size,
         pipeline_model_parallel_size=pipeline_model_parallel_size,
+        context_parallel_size=context_parallel_size,
     )
 
-    all_data_parallel_ranks = ps.get_all_data_parallel_ranks()
+    with_context_parallel = context_parallel_size > 1
+    all_data_parallel_ranks = ps.get_all_data_parallel_ranks(with_context_parallel)
 
     assert len(all_data_parallel_ranks) == tensor_model_parallel_size * pipeline_model_parallel_size
 
@@ -551,16 +568,20 @@ def test_get_all_data_parallel_ranks(tensor_model_parallel_size, pipeline_model_
 
 @pytest.mark.parametrize('tensor_model_parallel_size', [1, 2, 4])
 @pytest.mark.parametrize('pipeline_model_parallel_size', [1, 2, 4])
-def test_get_node_data_parallel_ranks(tensor_model_parallel_size, pipeline_model_parallel_size):
+@pytest.mark.parametrize('context_parallel_size', [1, 2, 4])
+def test_get_node_data_parallel_ranks(
+    tensor_model_parallel_size, pipeline_model_parallel_size, context_parallel_size
+):
 
-    if tensor_model_parallel_size * pipeline_model_parallel_size > 8:
+    if tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size > 8:
         pytest.skip(
-            f"Provided configuration {tensor_model_parallel_size=} and {pipeline_model_parallel_size=} is not supported for 8c. Skipping ..."
+            f"Provided configuration {tensor_model_parallel_size=}, {pipeline_model_parallel_size=} and {context_parallel_size=} is not supported for 8c. Skipping ..."
         )
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tensor_model_parallel_size,
         pipeline_model_parallel_size=pipeline_model_parallel_size,
+        context_parallel_size=context_parallel_size,
     )
 
     world_size = torch.distributed.get_world_size()
@@ -571,7 +592,7 @@ def test_get_node_data_parallel_ranks(tensor_model_parallel_size, pipeline_model
             f"The test is designed for 8c configurations, but the world_size is {world_size} and the device_count is {device_count}. Skipping ..."
         )
 
-    dp_g = torch.distributed.get_process_group_ranks(ps.get_data_parallel_group(False))
+    dp_g = torch.distributed.get_process_group_ranks(ps.get_data_parallel_group(True))
 
     node_data_parallel_global_ranks, node_ranks = get_node_data_parallel_ranks(dp_g)
 

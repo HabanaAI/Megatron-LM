@@ -5,10 +5,13 @@ Before you get started, make sure to review the [Supported Configurations](../..
 
 ## Table of Contents
 * [Setup](#setup)
+* [Mpirun Settings](#mpirun-settings)
 * [Training Script Settings](#training-script-settings)
+* [Mixtral Training and Examples](#mixtral-training-and-examples)
 * [Useful Tools](#useful-tools)
 * [Supported Configuration](#supported-configuration)
 * [Known Issues](#known-issues)
+
 
 # Setup
 Please follow the instructions provided in the [Intel Gaudi Installation Guide](https://docs.habana.ai/en/latest/Installation_Guide/index.html)
@@ -16,7 +19,7 @@ to set up the environment including the `$PYTHON` environment variable. To achie
 The guides will walk you through the process of setting up your system to run the model on Gaudi 2.
 
 ## How to Use
-Users bear sole liability and responsibility to follow and comply with any third party licenses, and Habana Labs disclaims and will bear no liability with respect to users’ use or compliance with third party licenses.
+Users bear sole liability and responsibility to follow and comply with any third party licenses, and Intel Corporation disclaims and will bear no liability with respect to users’ use or compliance with third party licenses.
 * Third-Party Models
   * In the course of using Megatron-LM, users may choose to download models created and distributed by third parties after reviewing background information about the models and agreeing to the license governing those models.
   * Notice: Intel does not create the content and does not warrant its accuracy or quality. By accessing the third-party content, or using materials trained on or with such content, you are indicating your acceptance of the terms associated with that content and warranting that your use complies with the applicable license.
@@ -69,6 +72,17 @@ export PYTHONPATH=$MEGATRON_LM_ROOT:$PYTHONPATH
 Follow the instructions in https://github.com/togethercomputer/RedPajama-Data/tree/main to recreate RedPajama dataset.
 
 
+# Mpirun Settings
+These are system specific settings. Use these parameters for efficient allocation of resources and optimized performance. Please refer [mpirun Configuration](https://docs.habana.ai/en/latest/PyTorch/PyTorch_Scaling_Guide/DDP_Based_Scaling.html#mpirun-configuration) for more details.
+* parallel environments (PEs) value is used to define how many processing elements(CPU cores) to be used for a given job. It is used as --map-by socket:PE=n. i.e. bind 'n' CPU cores to each MPI process.
+  ```
+  HL_PE=13
+  ```
+* processes per resource (PPR) specifies how many MPI processes should be launched per specific resource (socket). It is mostly used in multi-node training, used as --map-by ppr:n:socket:PE=m. i.e. 'n' MPI processes on each processor socket & bind 'm' CPU cores to each MPI process.
+  ```
+  HL_PPR=4
+  ```
+
 # Training Script Settings
 * Based on the tokenization method, update the tokenizer type:
   ```
@@ -86,12 +100,23 @@ Follow the instructions in https://github.com/togethercomputer/RedPajama-Data/tr
   ```
   HL_TOKENIZER_MODEL=path/to/tokenizer.model
   ```
+* To run in lazy mode
+  ```
+  HL_USE_LAZY_MODE=1
+  ```
+* To run in pure eager mode
+  ```
+  HL_USE_LAZY_MODE=0
+  HL_TORCH_COMPILE_DISABLE=1
+  ```
 
 Note: For the training commands, make sure to change the IP addresses in hostsfile according to your setup.
 `HL_RESULTS_DIR` and `HL_DATA_DIR_ROOT` must be shared writable across all nodes and launchers when running training on more than 8 cards.
 The same applies to `HL_CHECKPOINTS_DIR`, `HL_TENSORBOARD_DIR` and `HL_KILL_SWITCH` if specified.
 If `HL_DATA_DIR_ROOT` is not writable, then `HL_CACHE_PATH` must be set to a writable location and
 must be shared and accessible across all nodes and launchers when running training on more than 8 cards.
+
+Note: `HL_USE_LAZY_MODE=0` will run in mixed mode with eager and compile due to fusions enabled by default. To get pure eager mode for direct comparison of eager and compile mode performance, user needs to set environment variables `HL_USE_LAZY_MODE=0` and `HL_TORCH_COMPILE_DISABLE=1`.
 
 ### Mixtral Training and Examples
 * Training of Mixtral is based on https://arxiv.org/abs/2401.04088
@@ -113,15 +138,13 @@ Refer to [training script settings](#training-script-settings) for details.
 This can be additonaly paired with Fused SDPA recompute `HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1`.
 More information on these settings can be found in the main README section.
 
-### Validated Configurations for MoE 
+### Validated Configurations for MoE
 * For the best performance and model accuracy, use MoE with the Fused MoE Kernel, as shown in the example below.
-* For configurations with MoE Capacity Factor or Capacity Bins, use AllToAll Token Dispatcher. The AllGather Token Dispatcher is sufficient for basic dropless mode.
-* Expert Parallel and Pipeline Parallel modes have been validated with the HPU Fused MoE Kernel and other MoE configurations.
+* For configurations with MoE Capacity Factor or Capacity Bins, use AllToAll Token Dispatcher. The AllGather Token Dispatcher is sufficient for basic drop/dropless mode.
+* Tensor, Data, Expert and Pipeline Parallel modes have been validated with the HPU Fused MoE Kernel and other MoE configurations.
 
 The following Mixtral 8x7B configuration has been validated as the most effective for Gaudi 2:
 4DP+8TP+SP with 8 experts top-2 and 32k sequence length and Aux Loss for load balancing.
-
-Expert Parallel and Pipeline Parallel have been validated to be functioning with HPU Fused MoE Kernel and other MoE configurations.
 
 ### Run Mixtral 8x7b on 32 HPUs, Lazy mode, with BF16 precision, sequence length 32k:
   ```
@@ -131,6 +154,22 @@ Expert Parallel and Pipeline Parallel have been validated to be functioning with
   HL_TP=8 \
   HL_SEQ_PARALLEL=1 \
   HL_CKP_ACT=3 \
+  HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1 \
+  HL_MOE_DYNAMIC=1 \
+  HL_DIST_OPTIMIZER=1 \
+  $MEGATRON_LM_ROOT/examples/mixtral/pretrain_mixtral.sh
+  ```
+
+### Run Mixtral 8x7b on 32 HPUs, Lazy mode, with BF16 precision, sequence length 32k and Context Parallelism:
+  ```
+  HL_HOSTSFILE=$MEGATRON_LM_ROOT/examples/hostsfile \
+  HL_USE_FAST_SOFTMAX=0 \
+  HL_NUM_NODES=4 \
+  HL_DP=2 \
+  HL_CP=2 \
+  HL_TP=8 \
+  HL_SEQ_PARALLEL=1 \
+  HL_CKP_ACT=0 \
   HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1 \
   HL_MOE_DYNAMIC=1 \
   HL_DIST_OPTIMIZER=1 \
@@ -162,7 +201,7 @@ For more information, please see [tools/checkpoint/README.md](../../tools/checkp
 # Supported Configuration
 | Validated on  | Intel Gaudi Software Version | PyTorch Version | Mode     |
 |---------------|------------------------------|-----------------|----------|
-| Gaudi 2       | 1.20.1                       | 2.6.0           | Training |
+| Gaudi 2       | 1.21.0                       | 2.6.0           | Training |
 
 # Known Issues
 * Only scripts and configurations mentioned in this README are supported and verified.

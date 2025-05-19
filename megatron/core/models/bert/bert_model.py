@@ -29,22 +29,24 @@ def get_te_version():
     return _get_te_version()
 
 
-# pylint: disable=line-too-long
 class BertModel(LanguageModule):
     """Transformer language model.
 
     Args:
         config (TransformerConfig): transformer config
-        num_tokentypes (int) : Set to 2 when args.bert_binary_head is True, and 0 otherwise. Defaults to 0.
+        num_tokentypes (int) : Set to 2 when args.bert_binary_head is True, and 0 otherwise.
+            Defaults to 0.
         transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
         vocab_size (int): vocabulary size
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
         pre_process (bool): Include embedding layer (used with pipeline parallelism)
         post_process (bool): Include an output layer (used with pipeline parallelism)
-        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are shared. Defaults to False.
-        position_embedding_type (string): Position embedding type. Options ['learned_absolute', 'rope'].
-            Defaults is 'learned_absolute'.
+        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel
+            ranks
+        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit
+            weights are shared. Defaults to False.
+        position_embedding_type (string): Position embedding type.
+            Options ['learned_absolute', 'rope']. Defaults is 'learned_absolute'.
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
     """
@@ -220,7 +222,9 @@ class BertModel(LanguageModule):
     def bert_extended_attention_mask(self, attention_mask: Tensor) -> Tensor:
         """Creates the extended attention mask
 
-        Converts the attention mask of dimension [batch size, 1, seq len] to [batch size, 1, seq len, seq len] or [batch size, 1, 1, seq_len] and makes it binary
+        Converts the attention mask of dimension
+        [batch size, 1, seq len] to [batch size, 1, seq len, seq len]
+        or [batch size, 1, 1, seq_len] and makes it binary
 
         Args:
             attention_mask (Tensor): The input attention mask

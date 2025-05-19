@@ -33,7 +33,7 @@ Python >= 3.10
 
 ```bash
 export MEGATRON_LM_ROOT=/path/to/Megatron-LM
-pip install $MEGATRON_LM_ROOT
+export PYTHONPATH=${MEGATRON_LM_ROOT}:${PYTHONPATH}
 pip install -r $MEGATRON_LM_ROOT/tools/checkpoint/requirements.txt
 ```
 
@@ -67,9 +67,8 @@ Python >= 3.10
 
 ```bash
 export MEGATRON_LM_ROOT=/path/to/Megatron-LM
-export PT_HPU_GPU_MIGRATION=1
+export PYTHONPATH=${MEGATRON_LM_ROOT}:${PYTHONPATH}
 
-pip install $MEGATRON_LM_ROOT
 pip install -r $MEGATRON_LM_ROOT/megatron/core/requirements.txt
 pip install -r $MEGATRON_LM_ROOT/tools/checkpoint/requirements.txt
 ```
@@ -81,6 +80,7 @@ To convert the distributed Hugging Face checkpoints into Megatron-LM format, run
 # To get more details on supported arguments.
 python $MEGATRON_LM_ROOT/tools/checkpoint/convert.py --help
 
+PT_HPU_GPU_MIGRATION=1 \
 python $MEGATRON_LM_ROOT/tools/checkpoint/convert.py \
 --bf16 \
 --model-type GPT \
@@ -110,10 +110,10 @@ python $MEGATRON_LM_ROOT/tools/checkpoint/convert.py \
 --model-type GPT \
 --loader mixtral_hf \
 --saver mcore \
---saver-transformer-impl transformer_engine \
+--saver-transformer-impl local \
 --target-tensor-parallel-size $TP \
 --target-pipeline-parallel-size $PP \
---target-expert-paralell-size $EP \
+--target-expert-parallel-size $EP \
 --source-margs-file "/path/to/hf/checkpoints/source_megatron_args.json" \
 --load-dir "/path/to/hf/checkpoints" \
 --save-dir "/path/to/save/mlm/checkpoint" \

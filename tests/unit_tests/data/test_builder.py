@@ -1,5 +1,7 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 ##
-# Compile megatron.core.datasets.helpers dependencies before BlendedDataset import
+# Compile megatron.core.datasets.helpers_cpp dependencies before BlendedDataset import
 ##
 
 import os
@@ -46,6 +48,8 @@ def do_setup(odir):
     return paths
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_builder():
     if torch.distributed.is_available():
         Utils.initialize_distributed()

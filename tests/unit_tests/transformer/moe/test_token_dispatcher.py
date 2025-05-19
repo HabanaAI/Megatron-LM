@@ -10,6 +10,7 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_real_cuda_device_available
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -21,6 +22,7 @@ class MoEModelTestContainer:
         ep_size,
         pp_size,
         cp_size=1,
+        moe_tp_size=None,
         data_parallel_random_init=False,
         num_moe_experts=8,
         moe_router_topk=2,
@@ -30,15 +32,17 @@ class MoEModelTestContainer:
         moe_pad_expert_input_to_capacity=False,
         moe_aux_loss_coeff=0.1,
         moe_capacity_bins_num=0,
-        deterministic_mode=False,
         **kwargs,
     ):
         self.num_local_experts = num_moe_experts // ep_size
+        if moe_tp_size is None:
+            moe_tp_size = tp_size
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=pp_size,
             expert_model_parallel_size=ep_size,
             context_parallel_size=cp_size,
+            expert_tensor_parallel_size=moe_tp_size,
         )
         _set_random_seed(seed_=123, data_parallel_random_init=data_parallel_random_init)
         local_expert_indices_offset = (
@@ -52,6 +56,7 @@ class MoEModelTestContainer:
             expert_model_parallel_size=ep_size,
             pipeline_model_parallel_size=pp_size,
             context_parallel_size=cp_size,
+            expert_tensor_parallel_size=moe_tp_size,
             moe_router_topk=moe_router_topk,
             num_moe_experts=num_moe_experts,
             moe_router_load_balancing_type=moe_router_load_balancing_type,
@@ -61,14 +66,12 @@ class MoEModelTestContainer:
             moe_capacity_bins_num=moe_capacity_bins_num,
             moe_aux_loss_coeff=moe_aux_loss_coeff,
             num_layers=1,
-            moe_extended_tp=kwargs.get("moe_extended_tp", False),
             moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
             hidden_size=kwargs.get("hidden_size", 16),
             num_attention_heads=kwargs.get("num_attention_heads", 8),
             use_cpu_initialization=kwargs.get("use_cpu_initialization", True),
             sequence_parallel=tp_size > 1,
             add_bias_linear=kwargs.get("add_bias_linear", False),
-            deterministic_mode=deterministic_mode,
         )
 
         # init moe layer
@@ -111,13 +114,7 @@ class MoEModelTestContainer:
             moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
         )
 
-        if self.config.moe_extended_tp:
-            scale = (
-                moe_layer.config.tensor_model_parallel_size
-                * moe_layer.config.expert_model_parallel_size
-            )
-        else:
-            scale = moe_layer.config.tensor_model_parallel_size
+        scale = moe_layer.config.expert_tensor_parallel_size
 
         permuted_local_hidden_states /= scale
 
@@ -136,7 +133,7 @@ class MoEModelTestContainer:
         ), "Restored hidden states do not match original hidden states"
 
     @pytest.mark.internal
-    def dispacher_capacity_test(self):
+    def dispatcher_capacity_test(self):
         moe_layer = self.moe_layer
         hidden_states = torch.randn((16, moe_layer.config.hidden_size))
         hidden_states = hidden_states.cuda()
@@ -152,6 +149,8 @@ class MoEModelTestContainer:
         (permuted_local_hidden_states, tokens_per_expert) = (
             moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
         )
+
+        print(f"Dispatched tokens per expert: {tokens_per_expert}")
 
         permuted_local_hidden_states /= moe_layer.config.tensor_model_parallel_size
 
@@ -176,19 +175,11 @@ class MoEModelTestContainer:
         hidden_states = torch.randn((16, moe_layer.config.hidden_size)).cuda()
         hidden_states.requires_grad = True
 
-        # Create the answer.
         moe_layer.config.moe_pad_expert_input_to_capacity = False
-        moe_layer.token_dispatcher.drop_and_pad = False
-
-        # Uncomment these lines to help bug location.
-        # hidden_states = torch.ones((8, moe_layer.config.hidden_size)).cuda()
-        # hidden_states = hidden_states * torch.range(1, 8).unsqueeze(1).cuda()
-        # hidden_states.requires_grad = True
-        # indices_1 = torch.tensor([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7]]).cuda()
-        # probs_1 = torch.ones_like(indices_1)
-        # indices_2 = torch.tensor([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7]]).cuda()
-        # probs_2 = torch.ones_like(indices_2)
-        # num_local_tokens_per_expert = torch.tensor([2, 2, 2, 2, 2, 2, 2, 2]).cuda()
+        if hasattr(moe_layer.token_dispatcher, "drop_and_pad"):
+            moe_layer.token_dispatcher.drop_and_pad = False
+        if hasattr(moe_layer.token_dispatcher, "fixed_expert_capacity"):
+            moe_layer.token_dispatcher.fixed_expert_capacity = False
 
         probs_1, indices_1 = moe_layer.router(hidden_states)
         (permuted_input_1, tokens_per_expert) = moe_layer.token_dispatcher.token_permutation(
@@ -207,7 +198,10 @@ class MoEModelTestContainer:
         moe_layer_2 = self.new_moe_layer()
         moe_layer_2.load_state_dict(moe_layer.state_dict())
         moe_layer_2.config.moe_pad_expert_input_to_capacity = True
-        moe_layer_2.token_dispatcher.drop_and_pad = True
+        if hasattr(moe_layer.token_dispatcher, "drop_and_pad"):
+            moe_layer.token_dispatcher.drop_and_pad = True
+        if hasattr(moe_layer.token_dispatcher, "fixed_expert_capacity"):
+            moe_layer.token_dispatcher.fixed_expert_capacity = True
 
         probs_2, indices_2 = moe_layer_2.router(hidden_states)
         (permuted_input_2, tokens_per_expert) = moe_layer_2.token_dispatcher.token_permutation(
@@ -251,7 +245,10 @@ class MoEModelTestContainer:
         moe_layer_2 = self.new_moe_layer()
         moe_layer_2.load_state_dict(moe_layer.state_dict())
         moe_layer_2.config.moe_pad_expert_input_to_capacity = True
-        moe_layer_2.token_dispatcher.drop_and_pad = True
+        if hasattr(moe_layer.token_dispatcher, "drop_and_pad"):
+            moe_layer.token_dispatcher.drop_and_pad = True
+        if hasattr(moe_layer.token_dispatcher, "fixed_expert_capacity"):
+            moe_layer.token_dispatcher.fixed_expert_capacity = True
         moe_layer_2.config.moe_capacity_bins_num = 0
         moe_layer_2.config.moe_expert_capacity_factor = 4.0
         moe_layer_2.router.capacity_bins = None
@@ -289,9 +286,11 @@ class TestAllgatherDispatcher:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4), (1, 1)])
-    @pytest.mark.parametrize("deterministic_mode", [True])  # TODO: add False
-    def test_forward_backward(self, tp_size, ep_size, deterministic_mode):
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    def test_forward_backward(self, tp_size, ep_size):
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -300,26 +299,31 @@ class TestAllgatherDispatcher:
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="allgather",
-            deterministic_mode=deterministic_mode,
         )
 
         container.dispatcher_dropless_test()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("tp_size,ep_size", [(2, 4)])
-    @pytest.mark.parametrize("deterministic_mode", [True])  # TODO: add False
-    def test_extend_tp_forward_backward(self, tp_size, ep_size, deterministic_mode):
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,moe_tp_size", [(1, 1, 8), (1, 2, 4), (1, 4, 2), (2, 2, 4)]
+    )
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    def test_moe_tp_forward_backward(self, tp_size, ep_size, moe_tp_size):
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
             pp_size=1,
+            moe_tp_size=moe_tp_size,
             num_moe_experts=8,
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="allgather",
-            moe_extended_tp=True,
-            deterministic_mode=deterministic_mode,
+            sequence_parallel=True,
+            moe_grouped_gemm=True if is_real_cuda_device_available() else False,
+            use_cpu_initialization=False,
         )
 
         container.dispatcher_dropless_test()

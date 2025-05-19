@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 
 import os
 

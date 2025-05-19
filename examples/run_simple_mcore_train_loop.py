@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# Copyright (C) 2024 Intel Corporation
 
 try:
     import habana_frameworks.torch

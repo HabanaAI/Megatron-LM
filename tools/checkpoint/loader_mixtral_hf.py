@@ -51,6 +51,7 @@ def load_args_from_checkpoint(margs, args, use_source_margs_file=False):
             "tensor_model_parallel_size",
             "pipeline_model_parallel_size",
             "expert_model_parallel_size",
+            "expert_tensor_parallel_size",
             "use_distributed_optimizer",
             "verify_checkpoint",
             "load",
@@ -73,6 +74,8 @@ def load_args_from_checkpoint(margs, args, use_source_margs_file=False):
                 margs.previous_pipeline_model_parallel_size = val
             if key == 'tensor_model_parallel_size' and hasattr(margs, key):
                 margs.previous_tensor_model_parallel_size = val
+            if key == 'expert_tensor_parallel_size' and hasattr(margs, key):
+                margs.previous_expert_tensor_parallel_size = val
 
             if key not in exclusions and hasattr(margs, key) and val != getattr(margs, key):
                 print(f"key: {key} replacing margs {getattr(margs, key)} with {val}.")
@@ -103,11 +106,12 @@ def load_args_from_checkpoint(margs, args, use_source_margs_file=False):
         margs.padded_vocab_size = mixtral_config.vocab_size
         margs.ffn_hidden_size = mixtral_config.intermediate_size
         margs.num_experts = mixtral_config.num_local_experts
-        margs.moe_extended_tp = False
+        # margs.expert_tensor_parallel_size = 1
         margs.transformer_impl = 'transformer_engine'
 
         margs.previous_tensor_model_parallel_size = 1
         margs.previous_pipeline_model_parallel_size = 1
+        margs.previous_expert_tensor_parallel_size = 1
 
         if mixtral_config.num_key_value_heads:
             margs.group_query_attention = True
@@ -171,18 +175,39 @@ def set_mlp_state(args, layer, hf_layer):
 
     layer.mlp.router.weight.data.copy_(hf_layer.block_sparse_moe.gate.weight)
 
-    mcore_experts = layer.mlp.experts.local_experts
     hf_experts = hf_layer.block_sparse_moe.experts
-    for expert_idx in range(args.num_experts):
-        mcore_experts[expert_idx].linear_fc1.weight.data.copy_(
-            torch.cat([
-                hf_experts[expert_idx].w1.weight,
-                hf_experts[expert_idx].w3.weight
-            ], dim=0)
-        )
-        mcore_experts[expert_idx].linear_fc2.weight.data.copy_(
-            hf_experts[expert_idx].w2.weight
-        )
+
+    if not args.moe_dynamic_hpu:
+        mcore_experts = layer.mlp.experts.local_experts
+
+        for expert_idx in range(args.num_experts):
+            mcore_experts[expert_idx].linear_fc1.weight.data.copy_(
+                torch.cat([
+                    hf_experts[expert_idx].w1.weight,
+                    hf_experts[expert_idx].w3.weight
+                ], dim=0)
+            )
+            mcore_experts[expert_idx].linear_fc2.weight.data.copy_(
+                hf_experts[expert_idx].w2.weight
+            )
+    else:
+        mcore_experts_fc1 = [f'local_expert_{expert_idx}_linear_fc1_weight' for expert_idx in range(args.num_experts)]
+        mcore_experts_fc2 = [f'local_expert_{expert_idx}_linear_fc2_weight' for expert_idx in range(args.num_experts)]
+
+        for expert_idx in range(args.num_experts):
+            linear_fc1 = getattr(layer.mlp.experts, mcore_experts_fc1[expert_idx])
+            linear_fc2 = getattr(layer.mlp.experts, mcore_experts_fc2[expert_idx])
+
+            linear_fc1.data.copy_(
+                torch.cat([
+                    hf_experts[expert_idx].w1.weight,
+                    hf_experts[expert_idx].w3.weight
+                ], dim=0)
+            )
+            linear_fc2.data.copy_(
+                hf_experts[expert_idx].w2.weight
+            )
+
 
 def set_layer_state(args, model, hf_model, layer_idx):
     '''Set transformer layer params.'''
@@ -261,7 +286,8 @@ def _load_checkpoint(queue, args):
                 '--no-initialization',
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--transformer-impl', 'transformer_engine',
-                '--load', args.load_dir
+                '--load', args.load_dir,
+                '--no-one-logger',
                 ]
 
     margs = parse_args()
@@ -347,13 +373,16 @@ def _load_checkpoint(queue, args):
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.previous_tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.previous_pipeline_model_parallel_size
+    md.previous_expert_tensor_parallel_size = margs.previous_expert_tensor_parallel_size
     md.true_vocab_size = margs.vocab_size # skips padding in saver
-    md.make_vocab_size_divisible_by = None
+    md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
     md.checkpoint_args = margs
     md.consumed_train_samples = 0
     md.consumed_valid_samples = 0
     md.num_experts = margs.num_experts
     md.moe_capacity_bins_num = margs.moe_capacity_bins_num
+    md.qkv_bias = margs.add_qkv_bias
+    md.moe_router_fp32 = margs.moe_router_fp32
 
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)
@@ -396,7 +425,10 @@ def _load_checkpoint(queue, args):
 
         # Grab all parallel tensors for this layer.
         layer = model.decoder.layers[layer_idx]
-        experts = layer.mlp.experts.local_experts
+        if margs.moe_dynamic_hpu:
+            experts = layer.mlp.experts
+        else:
+            experts = layer.mlp.experts.local_experts
 
         message["router weight"] = layer.mlp.router.weight.data
 
@@ -407,13 +439,20 @@ def _load_checkpoint(queue, args):
             message["total requested capacity last"] = capacity_bins["optimize_moe_total_requested_capacity_last"][layer_idx]
             message["capacity bins"] = capacity_bins['capacity_bins'][layer_idx]
         
-        if is_real_cuda_device_available() and md.swiglu:
-            chunked_mlp_l0_weight =  [torch.chunk(local_expert.linear_fc1.weight.data, 2, dim=0) for local_expert in experts]
-            message["mlp l0 weight W"] = torch.stack([local_weight[0] for local_weight in chunked_mlp_l0_weight], dim=0)
-            message["mlp l0 weight V"] = torch.stack([local_weight[1] for local_weight in chunked_mlp_l0_weight], dim=0)
+        if not margs.moe_dynamic_hpu:
+            if is_real_cuda_device_available() and md.swiglu:
+                chunked_mlp_l0_weight =  [torch.chunk(local_expert.linear_fc1.weight.data, 2, dim=0) for local_expert in experts]
+                message["mlp l0 weight W"] = torch.stack([local_weight[0] for local_weight in chunked_mlp_l0_weight], dim=0)
+                message["mlp l0 weight V"] = torch.stack([local_weight[1] for local_weight in chunked_mlp_l0_weight], dim=0)
+            else:
+                message["mlp l0 weight"] = torch.stack([local_expert.linear_fc1.weight.data for local_expert in experts])
+            message["mlp l1 weight"] = torch.stack([local_expert.linear_fc2.weight.data for local_expert in experts], dim=0)
         else:
-            message["mlp l0 weight"] = torch.stack([local_expert.linear_fc1.weight.data for local_expert in experts])
-        message["mlp l1 weight"] = torch.stack([local_expert.linear_fc2.weight.data for local_expert in experts], dim=0)
+            mcore_experts_fc1 = [f'local_expert_{expert_idx}_linear_fc1_weight' for expert_idx in range(margs.num_experts)]
+            mcore_experts_fc2 = [f'local_expert_{expert_idx}_linear_fc2_weight' for expert_idx in range(margs.num_experts)]
+
+            message["mlp l0 weight"] = torch.stack([getattr(experts, linear_fc1).data for linear_fc1 in mcore_experts_fc1])
+            message["mlp l1 weight"] = torch.stack([getattr(experts, linear_fc2).data for linear_fc2 in mcore_experts_fc2])
 
         queue_put(f"transformer layer {layer_idx}", message)
 

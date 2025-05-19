@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 
 # Runs the "175B" parameter model
 
@@ -30,6 +30,9 @@ EVAL_ITERS=${HL_EVAL_ITERS:-10}
 GBS=${HL_GBS:-1536}
 TP=${HL_TP:-8}
 PP=${HL_PP:-16}
+USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
+
+export PT_HPU_LAZY_MODE=$USE_LAZY_MODE
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 

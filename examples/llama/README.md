@@ -5,6 +5,7 @@ Before you get started, make sure to review the [Supported Configuration](../../
 
 ## Table of Contents
 * [Setup](#setup)
+* [Mpirun Settings](#mpirun-settings)
 * [Training Script Settings](#training-script-settings)
 * [LLaMA Training and Examples](#llama-training-and-examples)
 
@@ -15,7 +16,7 @@ to set up the environment including the `$PYTHON` environment variable. To achie
 The guides will walk you through the process of setting up your system to run the model on Gaudi 2 & Gaudi 3.
 
 ## How to Use
-Users bear sole liability and responsibility to follow and comply with any third party licenses, and Habana Labs disclaims and will bear no liability with respect to users’ use or compliance with third party licenses.
+Users bear sole liability and responsibility to follow and comply with any third party licenses, and Intel Corporation disclaims and will bear no liability with respect to users’ use or compliance with third party licenses.
 * Third-Party Models
   * In the course of using Megatron-LM, users may choose to download models created and distributed by third parties after reviewing background information about the models and agreeing to the license governing those models.
   * Notice: Intel does not create the content and does not warrant its accuracy or quality. By accessing the third-party content, or using materials trained on or with such content, you are indicating your acceptance of the terms associated with that content and warranting that your use complies with the applicable license.
@@ -148,7 +149,22 @@ Use one of the three methods below to tokenize the dataset. You can use any numb
     # use the tokenized files generated from above command to train
     ```
 
+# Mpirun Settings
+These are system specific settings. Use these parameters for efficient allocation of resources and optimized performance. Please refer [mpirun Configuration](https://docs.habana.ai/en/latest/PyTorch/PyTorch_Scaling_Guide/DDP_Based_Scaling.html#mpirun-configuration) for more details.
+* parallel environments (PEs) value is used to define how many processing elements(CPU cores) to be used for a given job. It is used as --map-by socket:PE=n. i.e. bind 'n' CPU cores to each MPI process.
+  ```
+  HL_PE=13
+  ```
+* processes per resource (PPR) specifies how many MPI processes should be launched per specific resource (socket). It is mostly used in multi-node training, used as --map-by ppr:n:socket:PE=m. i.e. 'n' MPI processes on each processor socket & bind 'm' CPU cores to each MPI process.
+  ```
+  HL_PPR=4
+  ```
+
 # Training Script Settings
+* Default launcher to run training is mpirun. torchrun launcher is also supported but needs manual steps to launch training job on all workers involved in the multinode configuration. Set following flags on all workers correctly `HL_TORCHRUN_MULTINODE`, `HL_TORCHRUN_NODE_RANK`, `HL_TORCHRUN_MASTER_ADDR`.
+  ```
+  HL_LAUNCHER_TYPE=mpirun
+  ```
 * Based on the tokenization method, update the tokenizer type:
   ```
   HL_TOKENIZER_TYPE=GPT2BPETokenizer
@@ -165,12 +181,23 @@ Use one of the three methods below to tokenize the dataset. You can use any numb
   ```
   HL_TOKENIZER_MODEL=path/to/tokenizer
   ```
+* To run in lazy mode
+  ```
+  HL_USE_LAZY_MODE=1
+  ```
+* To run in pure eager mode
+  ```
+  HL_USE_LAZY_MODE=0
+  HL_TORCH_COMPILE_DISABLE=1
+  ```
 
 Note: For the training commands, make sure to change the IP addresses in hostsfile according to your setup.
 `HL_RESULTS_DIR` and `HL_DATA_DIR_ROOT` must be shared writable across all nodes and launchers when running training on more than 8 cards.
 The same applies to `HL_CHECKPOINTS_DIR`, `HL_TENSORBOARD_DIR` and `HL_KILL_SWITCH` if specified.
 If `HL_DATA_DIR_ROOT` is not writable, then `HL_DATA_CACHE_DIR` must be set to a writable location and
 must be shared and accessible across all nodes and launchers when running training on more than 8 cards.
+
+Note: `HL_USE_LAZY_MODE=0` will run in mixed mode with eager and compile due to fusions enabled by default. To get pure eager mode for direct comparison of eager and compile mode performance, user needs to set environment variables `HL_USE_LAZY_MODE=0` and `HL_TORCH_COMPILE_DISABLE=1`.
 
 
 # LLaMA Training and Examples
@@ -187,6 +214,7 @@ must be shared and accessible across all nodes and launchers when running traini
   # Retain default settings for optimal performance.
 
   # FP8 config
+  HL_USE_LAZY_MODE=1 \
   HL_FP8=1 \
   HL_TRANSFORMER_IMPL=transformer_engine \
   HL_SEQ_PARALLEL=0 \
@@ -200,6 +228,7 @@ must be shared and accessible across all nodes and launchers when running traini
   $MEGATRON_LM_ROOT/examples/llama/pretrain_llama.sh
 
   # BF16 config
+  HL_USE_LAZY_MODE=1 \
   HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
   HL_CKP_ACT=2 \
   HL_LLAMA_VER=3.1 \
@@ -215,6 +244,7 @@ must be shared and accessible across all nodes and launchers when running traini
   # Retain default settings for optimal performance.
 
   # FP8 config
+  HL_USE_LAZY_MODE=1 \
   HL_FP8=1 \
   HL_TRANSFORMER_IMPL=transformer_engine \
   HL_SEQ_PARALLEL=0 \
@@ -229,6 +259,7 @@ must be shared and accessible across all nodes and launchers when running traini
   $MEGATRON_LM_ROOT/examples/llama/pretrain_llama.sh
 
   # BF16 config
+  HL_USE_LAZY_MODE=1 \
   HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
   HL_CKP_ACT=2 \
   HL_NUM_NODES=8 \
@@ -245,6 +276,7 @@ must be shared and accessible across all nodes and launchers when running traini
   ```bash
   # Retain default settings for optimal performance.
 
+  HL_USE_LAZY_MODE=1 \
   HL_NUM_WORKERS=0 \
   HL_SEQ_LEN=32768 \
   HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
@@ -257,10 +289,30 @@ must be shared and accessible across all nodes and launchers when running traini
   $MEGATRON_LM_ROOT/examples/llama/pretrain_llama.sh
   ```
 
+* Run LLaMA 3.1 8B on 8 HPUs with BF16 precision and Context Parallelism:
+
+  ```bash
+  # Retain default settings for optimal performance.
+
+  HL_USE_LAZY_MODE=1 \
+  HL_USE_FAST_SOFTMAX=0 \
+  HL_NUM_WORKERS=0 \
+  HL_SEQ_LEN=32768 \
+  HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
+  HL_CKP_ACT=0 \
+  HL_LLAMA_VER=3.1 \
+  HL_LLAMA_MODEL_SIZE=8 \
+  HL_DP=1 \
+  HL_CP=8 \
+  HL_PP=1 \
+  $MEGATRON_LM_ROOT/examples/llama/pretrain_llama.sh
+  ```
+
 * Run LLaMA 3.1 70B on 32 HPUs with BF16 precision:
   ```bash
   # Retain default settings for optimal performance.
 
+  HL_USE_LAZY_MODE=1 \
   HL_NUM_WORKERS=0 \
   HL_SEQ_LEN=32768 \
   HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
@@ -273,24 +325,42 @@ must be shared and accessible across all nodes and launchers when running traini
   HL_PP=1 \
   $MEGATRON_LM_ROOT/examples/llama/pretrain_llama.sh
 
+* Run LLaMA 3.1 70B on 32 HPUs with BF16 precision and Context Parallelism:
+  ```bash
+  # Retain default settings for optimal performance.
+
+  HL_USE_LAZY_MODE=1 \
+  HL_USE_FAST_SOFTMAX=0 \
+  HL_NUM_WORKERS=0 \
+  HL_SEQ_LEN=32768 \
+  HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
+  HL_CKP_ACT=0 \
+  HL_NUM_NODES=4 \
+  HL_LLAMA_VER=3.1 \
+  HL_LLAMA_MODEL_SIZE=70 \
+  HL_DP=2 \
+  HL_CP=2 \
+  HL_TP=8 \
+  HL_PP=1 \
+  $MEGATRON_LM_ROOT/examples/llama/pretrain_llama.sh
+
 ### LLaMA 2 Recipes
 * Run LLaMA 2 7B on 8 HPUs with BF16 precision:
   ```
-  HL_LLAMA_VER=2 HL_NUM_NODES=1 HL_PP=2 HL_TP=2 HL_DP=2 examples/llama/pretrain_llama.sh
+  HL_USE_LAZY_MODE=1 HL_LLAMA_VER=2 HL_NUM_NODES=1 HL_PP=2 HL_TP=2 HL_DP=2 examples/llama/pretrain_llama.sh
   ```
 
 * Run LLaMA 2 7B on 64 HPUs with BF16 precision:
   ```
-  HL_LLAMA_VER=2 HL_HOSTSFILE=examples/hostsfile HL_NUM_NODES=8 HL_PP=2 HL_TP=2 HL_DP=16 examples/llama/pretrain_llama.sh
+  HL_USE_LAZY_MODE=1 HL_LLAMA_VER=2 HL_HOSTSFILE=examples/hostsfile HL_NUM_NODES=8 HL_PP=2 HL_TP=2 HL_DP=16 examples/llama/pretrain_llama.sh
   ```
 
 * Run LLaMA 2 70B on 32 HPUs with BF16 precision:
   ```
-  HL_LLAMA_VER=2 HL_HOSTSFILE=examples/hostsfile HL_LLAMA_MODEL_SIZE=70 HL_NUM_NODES=4 HL_PP=4 HL_TP=8 HL_DP=1 examples/llama/pretrain_llama.sh
+  HL_USE_LAZY_MODE=1 HL_LLAMA_VER=2 HL_HOSTSFILE=examples/hostsfile HL_LLAMA_MODEL_SIZE=70 HL_NUM_NODES=4 HL_PP=4 HL_TP=8 HL_DP=1 examples/llama/pretrain_llama.sh
   ```
 
 
 # Known Issues
 * Only scripts and configurations mentioned in this README are supported and verified.
-* Full recompute option is currently not supported in HL_PP > 1 configurations in training with fp8 precision.
-* Sporadic numerical and stability issues can occur when training with fp8 precision and fast softmax enabled.
+* Sporadic NaN in loss can occur when training with fp8 precision. In such case, it is suggested to resume training from the last saved checkpoint.

@@ -137,6 +137,7 @@ class TestTEParallelSequentialMLP:
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
     )
+    @pytest.mark.internal
     def test_constructor(self):
         for i in range(self.num_local_experts):
             assert torch.equal(
@@ -153,6 +154,7 @@ class TestTEParallelSequentialMLP:
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
     )
+    @pytest.mark.internal
     def test_gpu_forward(self):
         self.local_sequential_mlp.cuda()
         self.te_sequential_mlp.cuda()
@@ -175,6 +177,7 @@ class TestTEParallelSequentialMLP:
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
     )
+    @pytest.mark.internal
     def test_gpu_forward_with_one_local_expert(self):
         model_parallel_cuda_manual_seed(123)
         local_sequential_mlp = SequentialMLP(1, self.transformer_config, self.local_mlp_spec)
@@ -199,6 +202,7 @@ class TestTEParallelSequentialMLP:
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
     )
+    @pytest.mark.internal
     def test_gpu_forward_with_no_tokens_allocated(self):
         self.local_sequential_mlp.cuda()
         self.te_sequential_mlp.cuda()

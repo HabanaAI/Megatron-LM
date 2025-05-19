@@ -37,9 +37,9 @@ MODEL_ARGS:
   --eval-iters: 10
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 2
-  --spec: local  
-  --deterministic-mode: true  
-  --use-checkpoint-args: true  
+  --spec: local
+  --deterministic-mode: true
+  --use-checkpoint-args: true
   --use-checkpoint-opt_param-scheduler: true
   --no-gradient-accumulation-fusion: true
   --data-cache-path: ${DATA_CACHE_PATH}

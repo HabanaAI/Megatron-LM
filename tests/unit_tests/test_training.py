@@ -1,7 +1,5 @@
 from types import SimpleNamespace
 
-import pytest
-
 from megatron.training.global_vars import set_args
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 from megatron.training.training import build_train_valid_test_data_iterators
@@ -9,7 +7,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def mock_train_valid_test_datasets_provider(train_val_test_num_samples):
-    return 1, 2, 3
+    return iter([1]), iter([2]), iter([3])
 
 
 def create_test_args():
@@ -35,15 +33,15 @@ class TestTraining:
         args = create_test_args()
         set_args(args)
 
-    @pytest.mark.internal
     def test_build_train_valid_test_data_iterators(self):
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
             mock_train_valid_test_datasets_provider
         )
+        train_data = next(train_iter)
+        valid_data = next(valid_iter)
+        test_data = next(test_iter)
+        assert (train_data, valid_data, test_data) == (1, 2, 3)
 
-        assert (train_iter, valid_iter, test_iter) == (1, 2, 3)
-
-    @pytest.mark.internal
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):
             while (after % multiple) != 0:

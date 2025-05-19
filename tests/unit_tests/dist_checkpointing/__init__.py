@@ -1,5 +1,3 @@
-# © 2024-2025 Intel Corporation
-
 import os
 import weakref
 from pathlib import Path
@@ -12,6 +10,7 @@ from tests.unit_tests.dist_checkpointing.utils import (
     init_checkpointing_mock_args,
     initialize_gpt_model,
     setup_model_and_optimizer,
+    setup_moe_model_and_optimizer,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -54,7 +53,6 @@ class TempNamedDir(TemporaryDirectory):
 
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
-
         if Utils.rank == 0:
             super().cleanup()
 

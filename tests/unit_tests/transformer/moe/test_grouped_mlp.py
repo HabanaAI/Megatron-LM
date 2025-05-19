@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Intel Corporation
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
@@ -10,7 +10,8 @@ from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_real_cuda_device_available, is_te_min_version
+from megatron.core.version_utils import is_habana_frameworks_min_version
 from megatron.legacy.model import Float16Module
 from megatron.training.arguments import parse_args
 from megatron.training.initialize import _set_random_seed
@@ -21,6 +22,7 @@ if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
 
 
+@pytest.mark.skipif(is_te_min_version("1.9.0.dev0"), reason="Switch to TEGroupedMLP when TE>1.9.")
 class TestParallelGroupedMLP:
 
     def setup_method(self, method, use_cpu_initialization=False, swiglu=True):
@@ -82,7 +84,10 @@ class TestParallelGroupedMLP:
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         tf_config.moe_grouped_gemm = True
-        self.grouped_mlp = MoELayer(tf_config)
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            self.num_experts, moe_grouped_gemm=True
+        )
+        self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
         self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
         print("done intializing for grouped gemm")
 
@@ -152,11 +157,11 @@ class TestParallelGroupedMLP:
             assert torch.equal(gmm_expert2_fc2, smm_expert2_fc2)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
     )
-    @pytest.mark.internal
     def test_gpu_forward(self):
         self.sequential_mlp.cuda()
         self.grouped_mlp.cuda()
@@ -175,11 +180,11 @@ class TestParallelGroupedMLP:
         # assert torch.equal(output_smm, output_gmm)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
     )
-    @pytest.mark.internal
     def test_gpu_forward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
         w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
@@ -194,11 +199,11 @@ class TestParallelGroupedMLP:
             assert str(e) == "Input batch_sizes should not be all zeros!"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
     )
-    @pytest.mark.internal
     def test_gradient_with_no_tokens_allocated(self):
         """Test that when no token is passed in, the parameters of the grouped MLP will also have gradients."""
         self.grouped_mlp.cuda()
@@ -212,8 +217,12 @@ class TestParallelGroupedMLP:
 
 
 @pytest.mark.skipif(
-    not is_te_min_version("1.9.0.dev0"),
+    is_real_cuda_device_available() and not is_te_min_version("1.9.0.dev0"),
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
+)
+@pytest.mark.skipif(
+    not is_real_cuda_device_available() and not is_habana_frameworks_min_version("1.21.0"),
+    reason="Intel TE Grouped MLP is only supported in habana frameworks 1.21.0 and later",
 )
 class TestTEGroupedMLP:
 
@@ -312,6 +321,7 @@ class TestTEGroupedMLP:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_gpu_forward_backward(self):
         self.sequential_mlp.cuda()
         self.grouped_mlp.cuda()
@@ -355,6 +365,7 @@ class TestTEGroupedMLP:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_gpu_forward_backward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
         self.grouped_mlp.cuda()

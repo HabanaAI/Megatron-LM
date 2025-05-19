@@ -1,13 +1,13 @@
+# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -17,10 +17,11 @@ from megatron.core.dist_checkpointing.mapping import (
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import _max_reduce_along_gather_last_dim
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 
 @dataclass
@@ -59,7 +60,8 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
-        # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        # If this is a gated linear unit we double the output width
+        # see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
@@ -92,12 +94,21 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc2',
         )
 
-    def forward(self, hidden_states):
+        self.bias_activation_fusion = self.config.bias_activation_fusion
 
+        self.scaled_swiglu = None
+        if self.config.fp8_smooth_swiglu:  # should be enabled in fp8 training fwd only
+            self.bias_activation_fusion = False  # global bias_activation_fusion setting to False should be done in arguments.py when fp8 TEGroupedMLP is ready
+            from intel_transformer_engine import ScaledSwiglu
+
+            self.scaled_swiglu = ScaledSwiglu()  # Smooth-SwiGLU https://arxiv.org/pdf/2409.12517
+
+    def forward(self, hidden_states):
+        """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
-        if self.config.bias_activation_fusion:
+        if self.bias_activation_fusion:
             if self.activation_func == F.gelu:
                 if self.config.gated_linear_unit:
                     intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
@@ -121,7 +132,23 @@ class MLP(MegatronModule):
                     x = torch.chunk(x, 2, dim=-1)
                     return self.config.activation_func(x[0]) * x[1]
 
-                intermediate_parallel = glu(intermediate_parallel)
+                if (
+                    self.scaled_swiglu is not None and self.training
+                ):  # should be enabled for fwd in fp8 training only
+                    # 1. smooth swiglu - downscale the intermediate_parallel and get the scale factor
+                    intermediate_parallel, s = self.scaled_swiglu(intermediate_parallel)
+                    s = _max_reduce_along_gather_last_dim(s)  # get max from TP group
+
+                    # [s, b, h]
+                    output, output_bias = self.linear_fc2(intermediate_parallel)
+
+                    if self.linear_fc2.sequence_parallel:
+                        s = scatter_to_sequence_parallel_region(s)
+
+                    output = output * s  # 2. smooth swiglu - upscale back the matmul output
+                    return output, output_bias
+                else:
+                    intermediate_parallel = glu(intermediate_parallel)
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
@@ -149,19 +176,26 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
     # and `cat`s during loading
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+
     swiglu_shard_axis = 0
     prepend_axis_num = len(sharded_offsets)
     original_shape = original_sh_ten.local_shape
     original_numel = int(np.prod(original_shape))
+    local_axis_size = original_shape[swiglu_shard_axis]
+    assert (
+        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
+    )
+    rank_offset = (
+        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] // local_axis_size
+    )
+    axis_frag = original_sh_ten.axis_fragmentations[swiglu_shard_axis + prepend_axis_num]
 
     @torch.no_grad()
     def sh_ten_build_fn(
         key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
-        offset_w = (swiglu_shard_axis + prepend_axis_num, tp_rank, tp_size * 2)
-        offset_v = (swiglu_shard_axis + prepend_axis_num, tp_size + tp_rank, tp_size * 2)
+        offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
+        offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset + axis_frag, axis_frag * 2)
         if flattened_range is None:
             tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
             return [

@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# Copyright (C) 2024 Intel Corporation
 # All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,6 +46,7 @@ class FusedDotProductAttention(MegatronModule):
         ), "Sliding Window Attention is not supported by FusedDotProductAttention!"
 
         from habana_frameworks.torch.hpex.kernels import FusedSDPA
+
         self.fused_sdpa = FusedSDPA
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type  # unused for now
@@ -66,11 +67,15 @@ class FusedDotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
+        attention_bias: Tensor = None,
         packed_seq_params: PackedSeqParams = None,
-        ):
-        assert packed_seq_params is None, (
-            "Packed sequence is not supported by FusedDotProductAttention."
-        )
+    ):
+        assert (
+            attention_bias is None
+        ), "Attention bias is not supported for FusedDotProductAttention."
+        assert (
+            packed_seq_params is None
+        ), "Packed sequence is not supported by FusedDotProductAttention."
 
         # [sq, b, np, hn] -> [b, np, sq, hn]
         q, k, v = [x.transpose(0, 1).transpose(1, 2) for x in [query, key, value]]
@@ -78,16 +83,22 @@ class FusedDotProductAttention(MegatronModule):
         scale = None
         attn_mask = None
         context_layer = self.fused_sdpa.apply(
-            q, k, v, attn_mask, self.config.attention_dropout, causal, scale,
-            self.use_fast_softmax, self.config.use_fused_sdpa_with_recompute
+            q,
+            k,
+            v,
+            attn_mask,
+            self.config.attention_dropout,
+            causal,
+            scale,
+            self.use_fast_softmax,
+            self.config.use_fused_sdpa_with_recompute,
         )
 
         # [b, np, sq, hn] --> [sq, b, np, hn]
         context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
 
         # [sq, b, np, hn] --> [sq, b, hp]
-        new_context_layer_shape = context_layer.size()[:-2] + \
-            (self.hidden_size_per_partition,)
+        new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
         return context_layer

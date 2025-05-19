@@ -21,10 +21,8 @@ class TestTopKRouter:
         num_moe_experts = 4
         if hasattr(request.node, 'callspec'):
             topk = request.node.callspec.params.get('moe_router_topk', 2)
-            deterministic_mode = request.node.callspec.params.get('deterministic_mode', False)
         else:
             topk = 2
-            deterministic_mode = False
         self.transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=12,
@@ -34,7 +32,6 @@ class TestTopKRouter:
             moe_router_load_balancing_type="aux_loss",
             moe_router_topk=topk,
             moe_aux_loss_coeff=0,
-            deterministic_mode=deterministic_mode,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False
@@ -58,8 +55,7 @@ class TestTopKRouter:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
     @pytest.mark.parametrize("moe_router_topk", [2, 3])
-    @pytest.mark.parametrize("deterministic_mode", [True])  # TODO: add False
-    def test_router_forward(self, moe_router_pre_softmax, moe_router_topk, deterministic_mode):
+    def test_router_forward(self, moe_router_pre_softmax, moe_router_topk):
         with torch.no_grad():
             self.router = self.router.cuda()
             self.router.config.moe_router_pre_softmax = moe_router_pre_softmax
@@ -71,8 +67,7 @@ class TestTopKRouter:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("moe_router_topk", [2, 3])
-    @pytest.mark.parametrize("deterministic_mode", [True])  # TODO: add False
-    def test_aux_loss(self, moe_router_topk, deterministic_mode):
+    def test_aux_loss(self, moe_router_topk):
         self.sequential_mlp = self.sequential_mlp.cuda()
 
         # Without aux loss

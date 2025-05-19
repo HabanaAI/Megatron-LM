@@ -57,7 +57,6 @@ class RetroConfig(TransformerConfig):
     retro_verify_neighbor_count: bool = True
     """Verify that len(GPT dataset) == len(saved neighbors)."""
 
-    # pylint: disable=line-too-long
     def __post_init__(self) -> None:
         """Validate Retro config."""
 
@@ -70,7 +69,9 @@ class RetroConfig(TransformerConfig):
                 assert os.getenv("NVTE_FUSED_ATTN") == "0"
             except Exception as e:
                 raise Exception(
-                    "When using Transformer Engine >= 1.3, environment vars NVTE_FLASH_ATTN and NVTE_FUSED_ATTN most both be defined and set to '0'. Currently, NVTE_FLASH_ATTN == %s, NVTE_FUSED_ATTN == %s."
+                    "When using Transformer Engine >= 1.3, environment vars NVTE_FLASH_ATTN "
+                    "and NVTE_FUSED_ATTN most both be defined and set to '0'. "
+                    "Currently, NVTE_FLASH_ATTN == %s, NVTE_FUSED_ATTN == %s."
                     % (
                         os.getenv("NVTE_FLASH_ATTN", "[unset]"),
                         os.getenv("NVTE_FUSED_ATTN", "[unset]"),
