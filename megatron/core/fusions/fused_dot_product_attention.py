@@ -35,11 +35,11 @@ class FusedDotProductAttention(MegatronModule):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        attention_dropout: float = None,
-        softmax_scale: float = None,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        cp_comm_type: Optional[str] = None,
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
-        cp_comm_type: str = None,
     ):
         super(FusedDotProductAttention, self).__init__(config=config)
 
@@ -85,10 +85,9 @@ class FusedDotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
-        attention_bias: Tensor = None,
+        attention_bias: Optional[Tensor] = None,
         packed_seq_params: PackedSeqParams = None,
-    ):
-        """Forward."""
+        ):
         assert (
             attention_bias is None
         ), "Attention bias is not supported for FusedDotProductAttention."

@@ -1,77 +1,71 @@
-import logging
-from typing import Dict
 
-import numpy as np
-import yaml
+import os
 
-from tests.functional_tests.python_test_utils import common, test_regular_pipeline
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+import pytest
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from tests.functional_tests.python_test_utils.common import TypeOfTest, read_tb_logs_as_list
+
+LOGS_DIR = os.getenv("LOGS_DIR")
+ALLOW_NONDETERMINISTIC = os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+STEP_INTERVAL = 5
 
 
-def test_resume_checkpoint_pipeline(
-    compare_approximate_results: bool, tensorboard_path: str, train_iters: int
-):
+def collect_train_test_metrics(logs_dir, index):
+    if not logs_dir:
+        return
+    train_loss_list = read_tb_logs_as_list(logs_dir, index)["lm loss"]
+    train_loss_list = [round(elem, 3) for elem in train_loss_list]
+    train_metrics = {"lm loss": train_loss_list[0 : len(train_loss_list) : STEP_INTERVAL]}
+    str_train_metrics = str(train_metrics).replace("'", '"')
+    print("\n ----------- The following are the metrics for ----------")
+    print(f"\n {str_train_metrics}", flush=True)
+    return train_metrics
 
-    first_run_values = common.read_tb_logs_as_list(
-        tensorboard_path, index=0, train_iters=train_iters, start_idx=(train_iters // 2) + 1
-    )
-    second_run_values = common.read_tb_logs_as_list(
-        tensorboard_path, index=1, train_iters=train_iters, start_idx=(train_iters // 2) + 1
-    )
 
-    checks = {
-        "iteration-time": [common.ApproximateTest(atol=2.0, rtol=0)],
-        "mem-allocated-bytes": [
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0)
-        ],
-        "mem-max-allocated-bytes": [
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0)
-        ],
-        "lm loss": [
-            common.DeterministicTest(),
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0),
-        ],
-        "num-zeros": [
-            common.DeterministicTest(),
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.20), rtol=0),
-        ],
-    }
+class TestCIPipeline:
+    margin_loss = 0.005
+    train_metrics_100 = collect_train_test_metrics(LOGS_DIR, 0)
+    train_metrics_50_to_100 = collect_train_test_metrics(LOGS_DIR, 1)
 
-    if (
-        len(
-            missing_metrics := [
-                golden_metric
-                for golden_metric in checks.keys()
-                if golden_metric not in first_run_values.keys()
-            ]
-        )
-        > 0
-    ):
-        logger.error(
-            f"The following metrics are required but not logged during training: {', '.join(missing_metrics)}"
-        )
-        assert False
+    def _test_helper(self, loss_type, test_type):
+        expected = self.train_metrics_100[loss_type]
+        assert (
+            len(expected) == 100 // STEP_INTERVAL
+        ), "Train metrics from first run (before checkpoint load) should \
+have {100 // STEP_INTERVAL} elements"
+        print("expected : " + str(expected))
+        actual = self.train_metrics_50_to_100[loss_type]
+        assert (
+            len(actual) == 50 // STEP_INTERVAL
+        ), "Train metrics from second run (after checkpoint load) should have \
+{50 // STEP_INTERVAL} elements"
+        print("actual : " + str(actual))
+        start_idx_expected = len(expected) - len(actual)
+        print("start_idx_expected:", start_idx_expected)
+        # Here we will just be comparing values of actual and second half (50-100) of expected
+        for i, (expected_val, actual_val) in enumerate(zip(expected[start_idx_expected:], actual)):
+            step = start_idx_expected + i * STEP_INTERVAL
+            if test_type == TypeOfTest.APPROX:
+                assert actual_val == pytest.approx(
+                    expected=expected_val, rel=self.margin_loss
+                ), f"The loss at step {step} should be approximately {expected_val} but it is \
+{actual_val}."
+            else:
+                assert (
+                    actual_val == expected_val
+                ), f"The value at step {step} should be {expected_val} but it is {actual_val}."
 
-    first_run_values = {
-        metric_name: metric_values
-        for (metric_name, metric_values) in first_run_values.items()
-        if metric_name in checks.keys()
-    }
+    @pytest.mark.skipif(not LOGS_DIR, reason="skipping as LOGS_DIR is not set.")
+    def test_lm_loss_deterministic(self):
+        allow_nondeterministic = bool(int(ALLOW_NONDETERMINISTIC))
+        if allow_nondeterministic:
+            pytest.skip(reason="Nondeterministic is allowed.")
+        self._test_helper("lm loss", TypeOfTest.DETERMINISTIC)
 
-    second_run_values = {
-        metric_name: metric_values
-        for (metric_name, metric_values) in second_run_values.items()
-        if metric_name in checks.keys()
-    }
-
-    logger.info(first_run_values)
-    logger.info(second_run_values)
-
-    test_regular_pipeline.test_regular_pipeline(
-        compare_approximate_results=compare_approximate_results,
-        golden_values=first_run_values,
-        tensorboard_logs=second_run_values,
-        checks=checks,
-    )
+    @pytest.mark.skipif(not LOGS_DIR, reason="skipping as LOGS_DIR is not set.")
+    def test_lm_loss_nondeterministic(self):
+        allow_nondeterministic = bool(int(ALLOW_NONDETERMINISTIC))
+        if not allow_nondeterministic:
+            pytest.skip(reason="Nondeterministic is not allowed.")
+        self._test_helper("lm loss", TypeOfTest.APPROX)

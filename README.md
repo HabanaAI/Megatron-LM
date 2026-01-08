@@ -79,27 +79,31 @@ export PYTHONPATH=$MEGATRON_LM_ROOT:$PYTHONPATH
 
 
 # Supported Configurations
-| Model                                       | Mode        | Intel Gaudi software Version | PyTorch Version | Validated on Gaudi 2 | Validated on Gaudi 3  |
-| --------------------------------------------| ----------- | ---------------------------- | --------------- | -------------------- | --------------------- |
-| [LLaMA 3.1](examples/llama/README.md)       | Pretraining | 1.22.0                       | 2.7.1           | :heavy_check_mark:   | :heavy_check_mark:*   |
-| [Mixtral 8x7B](examples/mixtral/README.md)  | Pretraining | 1.22.0                       | 2.7.1           | :heavy_check_mark:** | :heavy_check_mark:*** |
-| [DeepSeek V3](examples/deepseek/README.md)  | Pretraining | 1.22.0                       | 2.7.1           | :heavy_check_mark:** |                       |
+| Model                                       | Mode        | Intel Gaudi software Version | PyTorch Version | Validated on Gaudi 2 | Validated on Gaudi 3 |
+| --------------------------------------------| ----------- | ---------------------------- | --------------- | -------------------- | -------------------- |
+| [LLaMA 3.1](examples/llama/README.md)       | Pretraining | 1.23.0                       | 2.9.0           | :heavy_check_mark:   | :heavy_check_mark:*  |
+| [Mixtral 8x7B](examples/mixtral/README.md)  | Pretraining | 1.23.0                       | 2.9.0           | :heavy_check_mark:** | :heavy_check_mark:** |
+| [DeepSeek V3](examples/deepseek/README.md)  | Pretraining | 1.23.0                       | 2.9.0           | :heavy_check_mark:** |                      |
 
 
 *Sporadic numerical instability can occur when training with fp8 precision.
 
 **Only BF16 configurations are currently enabled.
 
-***Only BF16, lazy and eager configurations are currently enabled.
-
 # Changelog
+## 1.23.0
+- Rebased code to upstream [core_r0.13.0](https://github.com/NVIDIA/Megatron-LM/tree/core_r0.13.0) release.
+- Added torch.compile support for Mixtral.
+- Added distributed checkpoint (`torch_dist`) support for LLaMA and Mixtral.
+- Enabled `torch` <-> `torch_dist` checkpoint conversion for LLaMA and Mixtral.
+- Modified mpirun --rank-by core to --rank-by slot in LLaMA, Mixtral & DeepSeek examples to make these compatible for OpenMPI version v5.0.0 and later
+
 ## 1.22.0
 - Rebased code to upstream [core_r0.11.0](https://github.com/NVIDIA/Megatron-LM/tree/core_r0.11.0) release.
 - Added support for zeroshot wikitext and lambada evaluation of Llama models and and usage is available [here](./tasks/zeroshot_gpt/README.md).
-- Added mpirun --prefix ${MPI_ROOT} option to LLaMA and Mixtral examples.
-- Added Host NIC settings support for LLaMA and  Mixtral examples.
+- Added mpirun --prefix ${MPI_ROOT} option to LLaMA, Mixtral & DeepSeek examples.
+- Added Host NIC settings support for LLaMA and Mixtral examples.
 - Added DeepSeek V3 Model support with bfloat16 data type.
-- Added torch.compile support for Mixtral (on Gaudi 2).
 
 ## 1.21.0
 - Rebased code to upstream [core_r0.10.0](https://github.com/NVIDIA/Megatron-LM/tree/core_r0.10.0) release.

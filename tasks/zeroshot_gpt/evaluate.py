@@ -7,6 +7,7 @@ import math
 from functools import partial
 import torch
 
+from megatron.core import mpu
 from megatron.training import get_args
 from megatron.training import print_rank_0, is_last_rank
 from megatron.training import get_tokenizer
@@ -71,14 +72,14 @@ def forward_step(batch, model, eval_metric, config):
     args.micro_batch_size = len(labels)
 
     tensor_shape = (args.seq_length, args.micro_batch_size, args.hidden_size)
-    input_tensor = recv_forward(tensor_shape, config)
+    input_tensor = recv_forward(tensor_shape, config, mpu.is_pipeline_first_stage())
 
     # Forward pass through the model.
     unwrapped_model = unwrap_model(model)
     unwrapped_model.set_input_tensor(input_tensor)
     output = model(tokens, position_ids, attention_mask)
 
-    send_forward(output, config)
+    send_forward(output, config, mpu.is_pipeline_last_stage())
 
     if parallel_state.is_pipeline_last_stage():
         # For loss, return the unreduced loss.

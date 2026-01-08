@@ -1,7 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass
+
+import warnings
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -28,6 +30,7 @@ class InferenceRequest:
 
     request_id: str
     prompt: str
+    sampling_params: Optional[SamplingParams] = None
     inference_parameters: Optional[SamplingParams] = None
     prompt_tokens: Optional[List[int]] = None
     arrival_time: Optional[float] = None
@@ -38,8 +41,32 @@ class InferenceRequest:
     generated_segments: Optional[List[str]] = None
     generated_sequence_lengths: Optional[List[int]] = None
     generated_tokens: Optional[torch.Tensor] = None
+    prompt_log_probs: Optional[torch.Tensor] = None
     generated_log_probs: Optional[torch.Tensor] = None
+    prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
+
+    def __post_init__(self):
+        if self.sampling_params is None and self.inference_parameters is not None:
+            warnings.warn(
+                "`inference_parameters` renamed to `sampling_params`, and the "
+                "previous name will be removed in Mcore 0.14."
+            )
+            self.sampling_params = self.inference_parameters
+
+
+@dataclass(kw_only=True)
+class DynamicInferenceRequest(InferenceRequest):
+    """Class for one inference request
+
+    Containing relevant data for an dynamic inference request
+
+    """
+
+    generated_tokens: List[int] = field(default_factory=list)
+    prompt: Optional[str] = None
+    prompt_tokens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)

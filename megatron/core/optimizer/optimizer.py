@@ -93,6 +93,9 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
+param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+
+
 class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
@@ -142,7 +145,7 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            if self.config.use_precision_aware_optimizer:
+            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
             else:
                 grad = param.grad
@@ -206,7 +209,10 @@ class MegatronOptimizer(ABC):
 
         if params:
             clip_grad_by_total_norm_fp32(
-                params, clip_grad, grad_norm, self.config.use_precision_aware_optimizer
+                params,
+                clip_grad,
+                grad_norm,
+                self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             )
         return grad_norm
 
@@ -216,7 +222,7 @@ class MegatronOptimizer(ABC):
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-            use_decoupled_grad=self.config.use_precision_aware_optimizer,
+            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
         )
 
     @abstractmethod
@@ -286,7 +292,10 @@ class MegatronOptimizer(ABC):
 
     @abstractmethod
     def sharded_state_dict(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Builds sharded state dict for the optimizer, based on model's sharded state dict.
 
@@ -294,12 +303,13 @@ class MegatronOptimizer(ABC):
             model_sharded_state_dict (ShardedStateDict): sharded state dict of the model
             is_loading (bool, optional): flag indicating whether the state dict will be
                 used to save or load the optimizer state. Defaults to False.
+            metadata (dict, optional): metadata controlling the sharded_state_dict logic.
 
         Returns: optimizer sharded state dict
         """
 
     @staticmethod
-    def _extract_common_per_param_step(state_dict) -> Union[int, torch.Tensor]:
+    def _extract_common_per_param_step(state_dict) -> Union[int, torch.Tensor, None]:
         common_step = None
         for param_idx, param_state in state_dict['state'].items():
             param_step = param_state.get('step', None)
@@ -317,6 +327,60 @@ class MegatronOptimizer(ABC):
     def _restore_common_per_param_step(state_dict: Dict, step: Union[int, torch.Tensor]):
         for param_idx, param_state in state_dict['state'].items():
             param_state['step'] = copy.deepcopy(step)
+
+    @staticmethod
+    def _filter_and_reorder_param_groups(
+        current_groups: List[Dict], state_dict_groups: List[Dict]
+    ) -> List[Dict]:
+        """Filter and reorder state_dict parameter groups to match current optimizer groups.
+        Keys used for matching align with those from _get_param_groups:
+        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
+
+        Args:
+            current_groups (List[Dict]): Parameter groups from the current optimizer instance.
+            state_dict_groups (List[Dict]): Parameter groups loaded from a state dict.
+
+        Returns:
+            List[Dict]: Filtered and reordered parameter groups matching the current optimizer.
+
+        Raises:
+            ValueError: If parameter groups in state dict don't match current optimizer.
+        """
+        # Define groups order that is needed in the current optimizer (coming from runtime)
+        needed_groups = [
+            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
+            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
+            for g in current_groups
+        ]
+
+        # Keep state_dict param group order since groups are LocalNonpersistentObject
+        # and their order is determined at runtime, not from the checkpoint.
+        params_in_state_dict_order = [g['params'] for g in state_dict_groups]
+        loaded_groups_map = {
+            tuple(
+                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
+                group[key] if key in group else group[f"pre_{key}"]
+                for key in param_group_identifier_keys
+            ): group
+            for group in state_dict_groups
+        }
+
+        final_groups = []
+        for key, params in zip(needed_groups, params_in_state_dict_order):
+            if key not in loaded_groups_map:
+                available_keys = '\n'.join(str(k) for k in loaded_groups_map.keys())
+                raise ValueError(
+                    f"Could not find parameter group with key {key} in loaded checkpoint.\n"
+                    f"Available keys:\n{available_keys}\n"
+                    f"Parameter group key definition: {param_group_identifier_keys}"
+                )
+
+            # Update group's parameters to preserve state dict ordering
+            group = loaded_groups_map[key]
+            group['params'] = params
+            final_groups.append(group)
+
+        return final_groups
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
@@ -461,7 +525,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            self._copy_main_params_to_model_params()
+            (
+                self._copy_main_params_to_model_params()
+                if not self.config.reuse_grad_buf_for_mxfp8_param_ag
+                else self._copy_main_params_to_param_buffer()
+            )
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 
@@ -663,7 +731,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             this=model_data, that=main_data, overflow_buf=self._dummy_overflow_buf
         )
 
-    def state_dict(self):
+    def state_dict(self, is_loading: bool = False):
+        if is_loading:
+            self.init_state_fn(self.optimizer, self.config)
+
         state_dict = {}
         state_dict['optimizer'] = self.optimizer.state_dict()
         if self.grad_scaler:
@@ -672,7 +743,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def sharded_state_dict(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
     ):
 
         if is_loading:
@@ -713,7 +787,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        state_dict['optimizer']['state']['common_step'] = step
+        if step:
+            state_dict['optimizer']['state']['common_step'] = step
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -726,6 +801,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
+
+        # Filter and reorder param groups to match current optimizer
+        state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
+            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
+        )
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
         # Grad scaler.
@@ -869,10 +949,18 @@ class FP32Optimizer(MegatronOptimizer):
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
+
+        # Filter and reorder param groups to match current optimizer
+        state_dict['param_groups'] = self._filter_and_reorder_param_groups(
+            self.optimizer.param_groups, state_dict['param_groups']
+        )
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
     ):
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
@@ -889,7 +977,8 @@ class FP32Optimizer(MegatronOptimizer):
         optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        state_dict['state']['common_step'] = step
+        if step:
+            state_dict['state']['common_step'] = step
         return state_dict
 
 
@@ -1111,7 +1200,7 @@ class ChainedOptimizer(MegatronOptimizer):
             return count_zeros_fp32(
                 params,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-                use_decoupled_grad=self.config.use_precision_aware_optimizer,
+                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             )
         else:
             num_zeros_in_grad = 0
@@ -1139,11 +1228,13 @@ class ChainedOptimizer(MegatronOptimizer):
                     optimizer.get_parameters(),
                     max_norm=optimizer.config.clip_grad,
                     total_norm=grad_norm,
-                    use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,
+                    use_decoupled_grad=(
+                        optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                    ),
                 )
 
         # Count the zeros in the grads.
-        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else 0
+        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
 
         update_successful = self.step_with_ready_grads()
 
@@ -1194,7 +1285,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
                 # Save checkpoint economically, only when DP rank = 0, state dict
                 # needs to be saved.
-                if torch.distributed.get_rank(optimizer.data_parallel_group) == 0:
+                if optimizer.data_parallel_group.rank() == 0:
                     states.append(state_dict)
                     save_states = True
                 else:
@@ -1267,8 +1358,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 continue
 
             # Lazy loading checkpoint, state dict is needed only when DP rank = 0.
-            if torch.distributed.get_rank(optimizer.data_parallel_group) == 0 and states is None:
-                states = torch.load(filename, weights_only=False)
+            if optimizer.data_parallel_group.rank() == 0 and states is None:
+                states = torch.load(filename)
 
             state_dict = states[idx] if states else None
             optimizer.load_parameter_state_from_dp_zero(

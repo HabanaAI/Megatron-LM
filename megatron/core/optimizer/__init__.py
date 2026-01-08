@@ -1,10 +1,13 @@
-# © 2024-2025 Intel Corporation
+# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+from torch.optim import SGD as CPUSGD
+from torch.optim import AdamW as CPUAdam
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -14,8 +17,6 @@ except ImportError:
         from apex.optimizers import FusedAdam as Adam
         from apex.optimizers import FusedSGD as SGD
     except ImportError:
-        import warnings
-
         warnings.warn(
             f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
         )
@@ -23,10 +24,10 @@ except ImportError:
         # Apex's FusedAdam is a drop-in replacement for torch's AdamW.
         # pylint: disable-next=line-too-long.
         # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
-        from torch.optim import AdamW as Adam
-        from torch.optim import SGD
+        from torch.optim import AdamW as Adam, SGD
 
 from megatron.core import mpu
+from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
@@ -38,6 +39,7 @@ from .optimizer import (
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     MegatronOptimizer,
+    param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
 
@@ -53,6 +55,8 @@ def _get_param_groups(
     min_lr: float,
     decoupled_lr: Optional[float],
     decoupled_min_lr: Optional[float],
+    ckpt_format: str,
+    ckpt_version: int,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -84,7 +88,20 @@ def _get_param_groups(
     # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
     params_map = {}
     for model_chunk in model_chunks:
+        ddp_config = model_chunk.ddp_config
+        if ddp_config.use_custom_fsdp:
+            named_parameters = model_chunk.optimizer_named_parameters()
+        else:
+            named_parameters = model_chunk.named_parameters()
+
         for name, param in model_chunk.named_parameters():
+            if (
+                ddp_config.use_custom_fsdp
+                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+            ):
+                param_shard = param
+                param = param.orig_param
+
             if not param.requires_grad:
                 continue
 
@@ -121,11 +138,45 @@ def _get_param_groups(
             key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
             if key not in params_map:
                 params_map[key] = []
-            params_map[key].append(param)
+            if (
+                ddp_config.use_custom_fsdp
+                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+            ):
+                params_map[key].append(param_shard)
+            else:
+                params_map[key].append(param)
+
+    # Distributed checkpoint requires all ranks to have the same param groups,
+    # so we need to align the param groups across ranks, otherwise we may have
+    # runtime error when loading the checkpoint or numerical error when resuming training.
+    params_key = list(params_map.keys())
+    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(gathered_params_key, params_key)
+    for keys in gathered_params_key:
+        for key in keys:
+            if key not in params_key:
+                params_key.append(key)
+
+    align_param_groups = torch.distributed.is_initialized() and (
+        (ckpt_version is not None and ckpt_version > 3.0) or ckpt_format == 'torch_dist'
+    )
+
+    if align_param_groups:
+        # For torch_dist checkpointing, all ranks must maintain the same key order
+        # in their parameter groups. To achieve this, rank 0 broadcasts the parameter
+        # group keys to all other ranks.
+        if torch.distributed.get_rank() != 0:
+            params_key = [None] * len(params_key)
+
+        torch.distributed.broadcast_object_list(params_key, src=0)
+
+        # Order the parameter groups according to the keys from rank 0.
+        params_map = {k: params_map[k] if k in params_map else [] for k in params_key}
 
     param_groups = []
-    for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr), params in params_map.items():
-        assert len(params) > 0
+    for key in params_key:
+        wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr = key
+        params = params_map[key] if key in params_map else []
         param_group = {
             'params': params,
             'wd_mult': wd_mult,
@@ -133,6 +184,10 @@ def _get_param_groups(
             'is_expert_parallel': is_expert_parallel,
             'is_decoupled_lr': is_decoupled_lr,
         }
+
+        # Ensure param_group has required keys for matching when loading optimizer state
+        # See MegatronOptimizer._filter_and_reorder_param_groups.
+        assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
         param_groups.append(param_group)
 
     param_groups = _update_min_and_max_lr_in_param_groups(
@@ -225,6 +280,8 @@ def _get_param_groups_and_buffers(
         min_lr=config.min_lr,
         decoupled_lr=config.decoupled_lr,
         decoupled_min_lr=config.decoupled_min_lr,
+        ckpt_format=config.ckpt_format,
+        ckpt_version=config.ckpt_version,
     )
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
@@ -265,19 +322,50 @@ def _get_megatron_optimizer_based_on_param_groups(
     Returns:
         Instance of MegatronOptimizer.
     """
-
     # when freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions
     if param_groups:
-        if config.optimizer in ['adam', 'fusedadamw']:
-            optimizer_class = None
+        if config.optimizer_cpu_offload:
+            if torch.__version__ < '2.3.0':
+                warnings.warn(
+                    "CPU offload is recommended for PyTorch >= 2.3.0, "
+                    "untested versions below this may have convergence issues."
+                )
+            gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
+            cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
+            if config.use_torch_optimizer_for_cpu_offload:
+                gpu_optimizer_cls = cpu_optimizer_cls
             if config.optimizer == 'adam':
-                optimizer_class = Adam
-            elif config.optimizer == 'fusedadamw':
-                from habana_frameworks.torch.hpex.optimizers import FusedAdamW
-
-                optimizer_class = FusedAdamW
+                gpu_optimizer_cls = Adam
+                cpu_optimizer_cls = CPUAdam
+                optimizer_defaults = dict(
+                    lr=config.lr,
+                    weight_decay=config.weight_decay,
+                    betas=(config.adam_beta1, config.adam_beta2),
+                    eps=config.adam_eps,
+                    bias_correction=True,
+                    fused=True,  # this flag is used to improve the performance of the cpu optimizer
+                )
+            else:
+                gpu_optimizer_cls = SGD
+                cpu_optimizer_cls = CPUSGD
+                optimizer_defaults = dict(
+                    lr=config.lr, weight_decay=config.weight_decay, momentum=config.sgd_momentum
+                )
+            optimizer = HybridDeviceOptimizer(
+                param_groups,
+                offload_fraction=config.optimizer_offload_fraction,
+                cpu_optimizer_cls=cpu_optimizer_cls,
+                gpu_optimizer_cls=gpu_optimizer_cls,
+                overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
+                pin_cpu_grads=config.pin_cpu_grads,
+                pin_cpu_params=config.pin_cpu_params,
+                param_update_in_fp32=True,
+                **optimizer_defaults,
+            )
+            init_state_fn = None
+        elif config.optimizer == 'adam':
             kwargs = {
                 "params": param_groups,
                 "lr": config.lr,
@@ -289,18 +377,28 @@ def _get_megatron_optimizer_based_on_param_groups(
             if config.use_precision_aware_optimizer:
                 kwargs.update(
                     {
-                        "master_weights": True,
-                        "use_decoupled_grad": True,
-                        "master_weight_dtype": config.main_params_dtype,
                         "exp_avg_dtype": config.exp_avg_dtype,
                         "exp_avg_sq_dtype": config.exp_avg_sq_dtype,
                     }
                 )
+                # Master weight is managed by MCore when main_params_dtype is fp32. This is
+                # because we want to use fp8 primary weight with precision aware optimizer.
+                # Otherwise, master weight will be managed by TransformerEngine.
+                # Delayed scaling is an exception because casting as well as the computation
+                # of the scaling factor can be conducted in the adam kernel.
+                if config.main_params_dtype != torch.float32 or config.fp8_recipe == "delayed":
+                    kwargs.update(
+                        {
+                            "master_weights": True,
+                            "use_decoupled_grad": True,
+                            "master_weight_dtype": config.main_params_dtype,
+                        }
+                    )
 
                 if is_te_min_version("2.1.0.dev0"):
-                    kwargs.update({"store_param_remainders": True})
+                    kwargs.update({"store_param_remainders": config.store_param_remainders})
 
-            optimizer = optimizer_class(**kwargs)
+            optimizer = Adam(**kwargs)
 
             def init_state_fn(opt, config=None):
                 for group in opt.param_groups:
@@ -312,19 +410,43 @@ def _get_megatron_optimizer_based_on_param_groups(
                             else:
                                 opt.initialize_state(p)
 
-        elif config.optimizer == 'sgd':
-            optimizer = SGD(
-                param_groups,
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-                momentum=config.sgd_momentum,
-            )
-            init_state_fn = None
-        else:
-            raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:
         optimizer = None
         init_state_fn = None
+
+    if config.optimizer in ['adam', 'fusedadamw']:
+        optimizer_class = None
+        if config.optimizer == 'adam':
+            optimizer_class = Adam
+        elif config.optimizer == 'fusedadamw':
+            from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+
+            optimizer_class = FusedAdamW
+        optimizer = optimizer_class(
+            param_groups,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            betas=(config.adam_beta1, config.adam_beta2),
+            eps=config.adam_eps,
+        )
+
+        def init_state_fn(opt, config=None):
+            for group in opt.param_groups:
+                for p in group['params']:
+                    if len(opt.state[p]) == 0:
+                        opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                        opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+
+    elif config.optimizer == 'sgd':
+        optimizer = SGD(
+            param_groups,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            momentum=config.sgd_momentum,
+        )
+        init_state_fn = None
+    else:
+        raise Exception('{} optimizer is not supported.'.format(config.optimizer))
 
     # Mixed precision optimizer.
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
@@ -367,6 +489,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                 data_parallel_group_idx=data_parallel_group_idx,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
+            # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
+            # weight gradients are all-reduced across optimizer instances, so each instance has
+            # the duplicated weight gradients, need to reduce gradient stats inside each instance.
+            setattr(
+                optimizer,
+                'grad_stats_parallel_group',
+                mpu.get_intra_distributed_optimizer_instance_group(),
+            )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
@@ -384,6 +514,7 @@ def get_megatron_optimizer(
     no_weight_decay_cond: Optional[Callable] = None,
     scale_lr_cond: Optional[Callable] = None,
     lr_mult: float = 1.0,
+    use_gloo_process_groups: bool = True,
 ) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
@@ -398,6 +529,8 @@ def get_megatron_optimizer(
             should have a scaled learning rate. Defaults to None.
         lr_mult (float, optional): learning rate multiplier for parameters that
             satisfy scale_lr_cond. Defaults to 1.0.
+        use_gloo_process_groups (bool): if false, disable use of Gloo process groups
+            in underlying Megatron optimizers.
 
     Returns:
         Instance of MegatronOptimizer.
@@ -412,21 +545,64 @@ def get_megatron_optimizer(
     else:
         all_dense_model_chunks = [model_chunks]
         overlap_param_gather_with_optimizer_step_flags = [False]
-    model_parallel_rank = torch.distributed.get_rank(mpu.get_model_parallel_group())
+    model_parallel_rank = mpu.get_model_parallel_group().rank()
 
-    if torch.distributed.get_world_size(
-        mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=False)
-    ) > torch.distributed.get_world_size(
-        mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
+    if (
+        mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=False).size()
+        > mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True).size()
     ):
-        distributed_optimizer_instance_id = torch.distributed.get_rank(
-            mpu.get_inter_partial_data_parallel_group()
+        distributed_optimizer_instance_id = (
+            mpu.get_inter_distributed_optimizer_instance_group().rank()
         )
     else:
         distributed_optimizer_instance_id = 0
 
     optimizers = []
     model_chunk_offset = 0
+    ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
+    if ddp_config.use_custom_fsdp:
+        for model_chunk, overlap_param_gather_with_optimizer_step in zip(
+            all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
+        ):
+            param_groups, buffers = _get_param_groups_and_buffers(
+                model_chunk,
+                model_chunk_offset=model_chunk_offset,
+                config=config,
+                no_weight_decay_cond=no_weight_decay_cond,
+                scale_lr_cond=scale_lr_cond,
+                lr_mult=lr_mult,
+                filter_fn=lambda g: True,
+                buffer_name='buffers',
+            )
+            # Pass Gloo process groups into optimizer only if needed.
+            if use_gloo_process_groups:
+                data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(
+                    with_context_parallel=True, partial_data_parallel=True
+                )
+            else:
+                data_parallel_group_gloo = None
+            optimizers.append(
+                _get_megatron_optimizer_based_on_param_groups(
+                    config,
+                    model_chunks=model_chunk,
+                    param_groups=param_groups,
+                    per_model_buffers=buffers,
+                    model_parallel_group=mpu.get_model_parallel_group(),
+                    data_parallel_group=mpu.get_data_parallel_group(
+                        with_context_parallel=True, partial_data_parallel=True
+                    ),
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=model_parallel_rank,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                )
+            )
+            model_chunk_offset += 1
+
+        if len(optimizers) == 1:
+            return optimizers[0]
+
+        return ChainedOptimizer(optimizers)
+
     for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
         all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
     ):
@@ -438,13 +614,20 @@ def get_megatron_optimizer(
             scale_lr_cond=scale_lr_cond,
             lr_mult=lr_mult,
             filter_fn=lambda g: not g['is_expert_parallel'],
-            buffer_name='dense_buffers',
+            buffer_name='buffers',
         )
         for model_chunk in dense_model_chunks:
             model_chunk.overlap_param_gather_with_optimizer_step = (
                 overlap_param_gather_with_optimizer_step
             )
 
+        # Pass Gloo process groups into optimizer only if needed.
+        if use_gloo_process_groups:
+            data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(
+                with_context_parallel=True, partial_data_parallel=True
+            )
+        else:
+            data_parallel_group_gloo = None
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config,
@@ -455,9 +638,7 @@ def get_megatron_optimizer(
                 data_parallel_group=mpu.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=True
                 ),
-                data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(
-                    with_context_parallel=True, partial_data_parallel=True
-                ),
+                data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
@@ -475,9 +656,14 @@ def get_megatron_optimizer(
         buffer_name='expert_parallel_buffers',
     )
     if len(moe_param_groups) > 0:
-        model_parallel_rank = torch.distributed.get_rank(
-            mpu.get_expert_tensor_model_pipeline_parallel_group()
-        )
+        model_parallel_rank = mpu.get_expert_tensor_model_pipeline_parallel_group().rank()
+        # Pass Gloo process groups into optimizer only if needed.
+        if use_gloo_process_groups:
+            data_parallel_group_gloo = mpu.get_expert_data_parallel_group_gloo(
+                partial_expert_data_parallel=True
+            )
+        else:
+            data_parallel_group_gloo = None
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config,
@@ -485,9 +671,12 @@ def get_megatron_optimizer(
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
                 model_parallel_group=mpu.get_expert_tensor_model_pipeline_parallel_group(),
-                data_parallel_group=mpu.get_expert_data_parallel_group(),
-                data_parallel_group_gloo=mpu.get_expert_data_parallel_group_gloo(),
+                data_parallel_group=mpu.get_expert_data_parallel_group(
+                    partial_expert_data_parallel=True
+                ),
+                data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
         )
 

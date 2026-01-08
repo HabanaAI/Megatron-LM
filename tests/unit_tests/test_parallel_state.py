@@ -1,10 +1,8 @@
 # Copyright (C) 2025 Intel Corporation
 
-import itertools
-import os
-
 import pytest
 import torch
+import itertools
 
 import megatron.core.parallel_state as ps
 from megatron.core.utils import get_node_data_parallel_ranks
@@ -48,8 +46,6 @@ def test_initialize_and_destroy_model_parallel(order):
     assert ps.get_expert_tensor_parallel_group() is not None
     assert ps.get_expert_data_parallel_group() is not None
     assert ps.get_expert_tensor_model_pipeline_parallel_group() is not None
-    assert ps.get_all_data_parallel_ranks() is not None
-    assert ps.get_all_data_parallel_ranks(True) is not None
     Utils.destroy_model_parallel()
     assert ps._MODEL_PARALLEL_GROUP is None
 
@@ -146,7 +142,7 @@ def test_expert_model_parallel_rank():
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_first_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
-    assert ps.is_pipeline_first_stage(ignore_virtual=True) == (rank == 0)
+    assert ps.is_pipeline_first_stage(ignore_virtual=False) == (rank == 0)
     assert ps.is_pipeline_first_stage() == (rank == 0)
     Utils.destroy_model_parallel()
 
@@ -154,7 +150,7 @@ def test_is_pipeline_first_stage(order):
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_last_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
-    assert ps.is_pipeline_last_stage(ignore_virtual=True) == (rank == world_size - 1)
+    assert ps.is_pipeline_last_stage(ignore_virtual=False) == (rank == world_size - 1)
     assert ps.is_pipeline_last_stage() == (rank == world_size - 1)
     Utils.destroy_model_parallel()
 
@@ -171,32 +167,6 @@ def test_virtual_pipeline_model_parallel_rank(order):
 def test_get_tensor_model_parallel_src_rank(order):
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size, order=order)
     assert ps.get_tensor_model_parallel_src_rank() == ((rank // world_size) * world_size)
-    Utils.destroy_model_parallel()
-
-
-@pytest.mark.parametrize('order', test_parallel_order)
-def test_encoder_tensor_pipeline_parallelism(order):
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=5,
-        pipeline_model_parallel_size=1,
-        encoder_pipeline_model_parallel_size=1,
-        encoder_tensor_model_parallel_size=3,
-        order=order,
-    )
-    if rank < 2:
-        assert ps.get_tensor_model_parallel_world_size() == 3
-        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], list)
-        last_ranks = ps.get_pipeline_model_parallel_last_rank()
-        assert isinstance(last_ranks, list)
-        assert len(last_ranks) == 2
-    elif rank == 2:
-        assert ps.get_tensor_model_parallel_world_size() == 3
-        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
-        assert isinstance(ps.get_pipeline_model_parallel_last_rank(), int)
-    else:
-        assert ps.get_tensor_model_parallel_world_size() == 5
-        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
-        assert isinstance(ps.get_pipeline_model_parallel_last_rank(), int)
     Utils.destroy_model_parallel()
 
 
@@ -235,8 +205,6 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     tp_dp_g = torch.distributed.get_process_group_ranks(
         ps.get_tensor_and_data_parallel_group(False)
     )
-    all_dp_ranks = ps.get_all_data_parallel_ranks()
-    all_dp_ranks_with_cp = ps.get_all_data_parallel_ranks(True)
 
     Utils.destroy_model_parallel()
 
@@ -262,8 +230,6 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     assert tp_dp_g == torch.distributed.get_process_group_ranks(
         ps.get_tensor_and_data_parallel_group(False)
     )
-    assert all_dp_ranks == ps.get_all_data_parallel_ranks()
-    assert all_dp_ranks_with_cp == ps.get_all_data_parallel_ranks(True)
 
     Utils.destroy_model_parallel()
 
@@ -272,8 +238,6 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     'src_tp_pp, ep_size',
     [((1, 2), 1), ((1, 4), 1), ((2, 2), 1), ((1, 2), 2), ((1, 4), 2), ((2, 2), 2)],
 )
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     Utils.initialize_model_parallel(
         *src_tp_pp, expert_model_parallel_size=ep_size, order='tp-ep-dp-pp'
@@ -285,8 +249,6 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     cp_g = torch.distributed.get_process_group_ranks(ps.get_context_parallel_group())
     amax_g = torch.distributed.get_process_group_ranks(ps.get_amax_reduction_group(False))
     mp_g = torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
-    all_dp_ranks = ps.get_all_data_parallel_ranks()
-    all_dp_ranks_with_cp = ps.get_all_data_parallel_ranks(True)
 
     Utils.destroy_model_parallel()
 
@@ -299,8 +261,6 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     assert cp_g == torch.distributed.get_process_group_ranks(ps.get_context_parallel_group())
     assert amax_g != torch.distributed.get_process_group_ranks(ps.get_amax_reduction_group(False))
     assert mp_g != torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
-    assert all_dp_ranks != ps.get_all_data_parallel_ranks()
-    assert all_dp_ranks_with_cp != ps.get_all_data_parallel_ranks(True)
 
     Utils.destroy_model_parallel()
 
@@ -449,6 +409,7 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
             )
         )
         # (pp, dp, ep, tp) -> (pp*dp, ep*tp)
+        tp_ep_rearrange = torch.transpose(all_ranks, 2, 3)
         tp_ep_rearrange = torch.reshape(
             all_ranks, (-1, expert_model_parallel_size * tensor_model_parallel_size)
         )
@@ -538,6 +499,27 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     assert expert_dp_group == expert_rank_generator.get_ranks(
         "dp"
     ), f"{expert_dp_group} != {expert_rank_generator.get_ranks('dp')}."
+
+
+@pytest.mark.parametrize('order', test_parallel_order)
+def test_encoder_tensor_pipeline_parallelism(order):
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=5,
+        pipeline_model_parallel_size=1,
+        encoder_pipeline_model_parallel_size=1,
+        encoder_tensor_model_parallel_size=3,
+        order=order,
+    )
+    if rank < 2:
+        assert ps.get_tensor_model_parallel_world_size() == 3
+        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], list)
+    elif rank == 2:
+        assert ps.get_tensor_model_parallel_world_size() == 3
+        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
+    else:
+        assert ps.get_tensor_model_parallel_world_size() == 5
+        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
+    Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize('tensor_model_parallel_size', [1, 2, 4])

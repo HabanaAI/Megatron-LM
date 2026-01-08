@@ -28,8 +28,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_real_cuda_device_available, is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -40,8 +41,10 @@ else:
 
 
 def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False, **config_kwargs):
+    """Initialize expert layer"""
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
+    model_comm_pgs = get_default_model_comm_pgs()
 
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     num_moe_experts = 8
@@ -54,11 +57,13 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         use_cpu_initialization=True,
         gated_linear_unit=glu,
         fp8="hybrid" if fp8 else None,
+        add_bias_linear=False,
+        moe_dynamic_hpu=False,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
     if expert_type == 'grouped':
-        model = GroupedMLP(num_local_experts, transformer_config)
+        model = GroupedMLP(num_local_experts, transformer_config, model_comm_pgs)
     elif expert_type == 'te_grouped':
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=True
@@ -67,6 +72,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
             num_local_experts,
             transformer_config,
             transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+            model_comm_pgs,
         )
     elif expert_type == 'sequential':
         transformer_layer_spec = get_gpt_layer_local_spec(
@@ -76,6 +82,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
             num_local_experts,
             transformer_config,
             transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+            model_comm_pgs,
         )
     elif expert_type == 'te_sequential':
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -85,6 +92,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
             num_local_experts,
             transformer_config,
             transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+            model_comm_pgs,
         )
     else:
         raise ValueError(
@@ -95,13 +103,18 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
 
 
 def get_pp_offsets():
+    """Get PP offsets"""
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     return ((0, pp_rank, pp_size),)
 
 
-expert_type = ['sequential', 'grouped']
-src_dest_expert_type = [('sequential', 'grouped'), ('grouped', 'sequential')]
+expert_type = ['sequential']
+src_dest_expert_type = []
+if is_real_cuda_device_available():
+    expert_type.append("grouped")
+    src_dest_expert_type.append(('sequential', 'grouped'))
+    src_dest_expert_type.append(('grouped', 'sequential'))
 if is_te_min_version("1.7.0.dev0"):
     expert_type.append('te_sequential')
     src_dest_expert_type.append(('sequential', 'te_sequential'))
@@ -113,10 +126,14 @@ if is_te_min_version("1.9.0.dev0"):
 
 
 class TestExpertLayerReconfiguration:
+    """Test expert layer reconfiguration"""
+
     def setup_method(self, method):
+        """Setup method"""
         pass
 
     def teardown_method(self, method):
+        """Teardown method"""
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
@@ -152,7 +169,7 @@ class TestExpertLayerReconfiguration:
             # ("ep-tp-dp-pp", "tp-ep-dp-pp"),
         ],
     )
-    @pytest.mark.flaky
+    @pytest.mark.parametrize("moe_dynamic_hpu", [False, True])
     def test_parallel_reconfiguration_e2e(
         self,
         tmp_path_dist_ckpt,
@@ -163,14 +180,11 @@ class TestExpertLayerReconfiguration:
         expert_type,
         load_order,
         store_order,
+        moe_dynamic_hpu,
     ):
         """Test model saving and loading with different TP/PP/EP/ETP(expert-tensor-parallel)"""
         src_tp, src_pp, src_ep, src_etp = src_tp_pp_ep_etp
         dest_tp, dest_pp, dest_ep, dest_etp = dest_tp_pp_ep_etp
-        if expert_type == 'grouped':
-            add_bias_linear = False
-        else:
-            add_bias_linear = True
         # Save checkpoint A
         Utils.initialize_model_parallel(
             src_tp,
@@ -185,7 +199,7 @@ class TestExpertLayerReconfiguration:
             tmp_path_dist_ckpt / 'test_expert_layer_reconfiguration_model_B'
         ) as ckpt_dir_B:
             model_A = initialize_expert_layer(
-                1, use_glu, expert_type, add_bias_linear=add_bias_linear
+                1, use_glu, expert_type, moe_dynamic_hpu=moe_dynamic_hpu
             )
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
@@ -209,7 +223,7 @@ class TestExpertLayerReconfiguration:
                 order=load_order,
             )
             model_B = initialize_expert_layer(
-                1, use_glu, expert_type, add_bias_linear=add_bias_linear
+                1, use_glu, expert_type, moe_dynamic_hpu=moe_dynamic_hpu
             )
             if use_fpsl:
                 load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
@@ -253,17 +267,20 @@ class TestExpertLayerReconfiguration:
         ],
     )
     @pytest.mark.parametrize("src_module,dest_module", src_dest_expert_type)
-    @pytest.mark.flaky
+    @pytest.mark.parametrize("moe_dynamic_hpu", [False, True])
     def test_sequential_grouped_mlp_interchangeable(
-        self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, src_module, dest_module
+        self,
+        tmp_path_dist_ckpt,
+        src_tp_pp_exp,
+        dest_tp_pp_exp,
+        use_glu,
+        src_module,
+        dest_module,
+        moe_dynamic_hpu,
     ):
         """Test model saving and loading with different TP/PP/expert parallelism"""
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
-        if src_module == 'grouped' or dest_module == 'grouped':
-            add_bias_linear = False
-        else:
-            add_bias_linear = True
         # Save checkpoint A
         Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
         with TempNamedDir(
@@ -273,7 +290,7 @@ class TestExpertLayerReconfiguration:
         ) as ckpt_dir_B:
 
             model_A = initialize_expert_layer(
-                1, use_glu, expert_type=src_module, add_bias_linear=add_bias_linear
+                1, use_glu, expert_type=src_module, moe_dynamic_hpu=moe_dynamic_hpu
             )
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
@@ -283,7 +300,7 @@ class TestExpertLayerReconfiguration:
 
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
             model_B = initialize_expert_layer(
-                1, use_glu, expert_type=dest_module, add_bias_linear=add_bias_linear
+                1, use_glu, expert_type=dest_module, moe_dynamic_hpu=moe_dynamic_hpu
             )
             load_strategy = None
             state_dict = load(
@@ -334,12 +351,13 @@ class TestExpertLayerReconfiguration:
         ) as ckpt_dir_B, fp8_autocast():
             tokens_per_expert = torch.tensor([16] * (8 // src_exp))
             input_tensor = torch.randn(tokens_per_expert.sum(), 16, device="cuda")
+            probs = torch.rand((tokens_per_expert.sum(),), dtype=torch.float32, device="cuda")
 
             # Save checkpoint A
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module, fp8=True)
             model_A = model_A.cuda()
             # fp8 meta is initialized at the first step
-            model_A(input_tensor, tokens_per_expert)
+            model_A(input_tensor, tokens_per_expert, probs)
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
             save_strategy = get_default_save_sharded_strategy()
@@ -372,6 +390,7 @@ class TestExpertLayerReconfiguration:
             # Should be bitwise equal
             if src_module == "te_grouped":
                 model_A, model_B = model_B, model_A
+            # Compare amax_history
             torch.testing.assert_close(
                 torch.cat(
                     [
@@ -381,8 +400,23 @@ class TestExpertLayerReconfiguration:
                         for i in range(8 // dest_exp)
                     ],
                     dim=1,
-                ).view(1024, -1),
+                ).view(model_A.local_experts[0].linear_fc1.fp8_meta["recipe"].amax_history_len, -1),
                 model_B.linear_fc1.fp8_meta["scaling_fwd"].amax_history,
+                rtol=0,
+                atol=0,
+            )
+            # Compare scale
+            torch.testing.assert_close(
+                torch.cat(
+                    [
+                        model_A.local_experts[i]
+                        .linear_fc1.fp8_meta["scaling_fwd"]
+                        .scale.view(-1, 1)
+                        for i in range(8 // dest_exp)
+                    ],
+                    dim=1,
+                ).view(-1),
+                model_B.linear_fc1.fp8_meta["scaling_fwd"].scale,
                 rtol=0,
                 atol=0,
             )
@@ -402,11 +436,12 @@ class TestExpertLayerReconfiguration:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_te_grouped_linear_torch_native') as ckpt_dir:
             tokens_per_expert = torch.tensor([16] * (8 // ep_size))
             input_tensor = torch.randn(tokens_per_expert.sum(), 16, device="cuda")
+            probs = torch.rand((tokens_per_expert.sum(),), dtype=torch.float32, device="cuda")
 
             # Save checkpoint
             model = initialize_expert_layer(1, use_glu, expert_type="te_grouped")
             model = model.cuda()
-            model(input_tensor, tokens_per_expert)
+            model(input_tensor, tokens_per_expert, probs)
             torch.save(model.state_dict(), ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt")
 
             # Load checkpoint

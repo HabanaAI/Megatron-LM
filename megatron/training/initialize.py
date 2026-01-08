@@ -12,13 +12,22 @@ import numpy as np
 import torch
 from datetime import timedelta
 
-from megatron.core.utils import is_real_cuda_device_available
-from megatron.legacy import fused_kernels
-from megatron.training import get_adlr_autoresume
-from megatron.training import get_args
-from megatron.training import get_tensorboard_writer
 from megatron.core import mpu, tensor_parallel
-from megatron.core.rerun_state_machine import initialize_rerun_state_machine, RerunErrorInjector, RerunDiagnostic, RerunMode
+from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
+from megatron.core.fusions.fused_bias_gelu import bias_gelu
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
+from megatron.core.parallel_state import create_group
+from megatron.core.rerun_state_machine import (
+    RerunDiagnostic,
+    RerunErrorInjector,
+    RerunMode,
+    initialize_rerun_state_machine,
+)
+from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version, is_real_cuda_device_available
+from megatron.legacy import fused_kernels
+from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
+from megatron.training import inprocess_restart
+from megatron.core import mpu, tensor_parallel
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.yaml_arguments import validate_yaml
 from megatron.training.checkpointing import load_args_from_checkpoint
@@ -26,8 +35,6 @@ from megatron.training.global_vars import set_global_variables
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
-from megatron.core.parallel_state import create_group
-from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +46,9 @@ def initialize_megatron(
     allow_no_cuda=False,
     skip_mpu_initialization=False,
     get_embedding_ranks=None,
-    get_position_embedding_ranks=None
+    get_position_embedding_ranks=None,
+    parsed_args=None,
+    store=None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -54,7 +63,10 @@ def initialize_megatron(
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
     # Parse arguments
-    args = parse_args(extra_args_provider, ignore_unknown_args)
+    if parsed_args is None:
+        args = parse_args(extra_args_provider, ignore_unknown_args)
+    else:
+        args = parsed_args
 
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
@@ -64,20 +76,20 @@ def initialize_megatron(
 
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
         assert args.load is not None, "--use-checkpoint-args requires --load argument"
-        assert (
-            args.non_persistent_ckpt_type != "local"
-        ), (
+        assert args.non_persistent_ckpt_type != "local", (
             "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
             "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
             "before initializing LocalCheckpointManager."
         )
         load_args_from_checkpoint(args)
 
+    if args.async_save and args.use_persistent_ckpt_worker:
+        init_persistent_async_worker()
+
     if args.yaml_cfg is not None:
         args = validate_yaml(args, args_defaults)
     else:
         validate_args(args, args_defaults)
-
 
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
@@ -88,9 +100,7 @@ def initialize_megatron(
 
     # init rerun state
     def state_save_func():
-        return {
-            'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()
-        }
+        return {'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
 
     def state_restore_func(state_dict):
         if state_dict['rng_tracker_states']:
@@ -105,18 +115,31 @@ def initialize_megatron(
             error_injection_rate=args.error_injection_rate,
             error_injection_type=RerunDiagnostic(args.error_injection_type),
         ),
+        result_rejected_tracker_filename=args.result_rejected_tracker_filename,
     )
 
     # torch.distributed initialization
     def finish_mpu_init():
         args = get_args()
         # Pytorch distributed.
-        _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks)
+        _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store)
 
         # Random seeds for reproducibility.
         if args.rank == 0:
             print("> setting random seeds to {} ...".format(args.seed))
-        _set_random_seed(args.seed, args.data_parallel_random_init, args.te_rng_tracker, args.inference_rng_tracker)
+        _set_random_seed(
+            args.seed,
+            args.data_parallel_random_init,
+            args.te_rng_tracker,
+            args.inference_rng_tracker,
+            use_cudagraphable_rng=args.enable_cuda_graph,
+        )
+
+        # Setup MoE aux loss scale value.
+        if args.num_experts is not None:
+            from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+
+            MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
 
     if skip_mpu_initialization:
         return None
@@ -153,8 +176,8 @@ def initialize_megatron(
         _compile_dependencies()
 
         if args.tp_comm_overlap:
-            #TODO: Should this be activated with just decoder-tp-comm-overlap too?
-           _initialize_tp_communicators()
+            # TODO: Should this be activated with just decoder-tp-comm-overlap too?
+            _initialize_tp_communicators()
 
         # No continuation function
         return None
@@ -256,15 +279,25 @@ def _initialize_tp_communicators():
        ub_cfgs = {}
 
     if getattr(args, 'decoder_tp_comm_overlap', False):
-        input_shape = [(args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
+        input_shape = [
+            (args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size,
+            args.hidden_size,
+        ]
     else:
-        input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
+        input_shape = [
+            (args.seq_length * args.micro_batch_size) // args.context_parallel_size,
+            args.hidden_size,
+        ]
 
     if is_te_min_version("1.9.0"):
         # The process group with the target bootstrap backend is created in Transformer Engine.
-        te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
-                                     use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,
-                                     bootstrap_backend = args.tp_comm_bootstrap_backend)
+        te_module.base.initialize_ub(
+            shape=input_shape,
+            tp_size=args.tensor_model_parallel_size,
+            use_fp8=(args.fp8 is not None),
+            ub_cfgs=ub_cfgs,
+            bootstrap_backend=args.tp_comm_bootstrap_backend,
+        )
     else:
         if args.tp_comm_bootstrap_backend != 'mpi':
             warnings.warn(
@@ -273,10 +306,15 @@ def _initialize_tp_communicators():
         # Create a MPI process group to help with TP communication overlap bootstrap.
         create_group(backend='mpi', group_desc='TP_BOOTSTRAP_GROUP_MPI')
 
-        te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
-                                     use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs)
+        te_module.base.initialize_ub(
+            shape=input_shape,
+            tp_size=args.tensor_model_parallel_size,
+            use_fp8=(args.fp8 is not None),
+            ub_cfgs=ub_cfgs,
+        )
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
+
+def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -303,15 +341,21 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
         else:
             device_id = None
 
+        # Set to non-default stream for cudagraph capturing.
+        if args.external_cuda_graph:
+            torch.cuda.set_stream(torch.cuda.Stream())
+
         # Call the init process
         init_process_group_kwargs = {
-            'backend' : args.distributed_backend,
+            'backend': args.distributed_backend,
+            'store': store,
             'world_size': args.world_size,
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
+        inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
@@ -319,11 +363,28 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
+            # Deprecation warning for encoder pipeline parallelism
+            if args.encoder_pipeline_model_parallel_size > 0 or args.encoder_tensor_model_parallel_size > 0:
+                warnings.warn(
+                    "Encoder-specific pipeline parallelism functionality is deprecated and will be removed in core_r0.14.0. "
+                    "This includes the parameters 'encoder_tensor_model_parallel_size' and 'encoder_pipeline_model_parallel_size', "
+                    "as well as all associated encoder pipeline parallel logic and infrastructure. "
+                    "This functionality is being replaced by the new 'orthotope' parallelism management system, which provides "
+                    "a more general and flexible approach to handling complex parallelism configurations including encoder-decoder models. "
+                    "Please refrain from building new features or dependencies on encoder pipeline parallelism as this entire "
+                    "capability will not be supported in future releases. For migration guidance and information on the orthotope "
+                    "system, please refer to the Megatron-LM documentation.",
+                    DeprecationWarning,
+                    stacklevel=2
+                )
+            
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 args.pipeline_model_parallel_split_rank,
+                pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
+                use_sharp=args.use_sharp,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 expert_model_parallel_size=args.expert_model_parallel_size,
@@ -336,6 +397,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 encoder_pipeline_model_parallel_size=args.encoder_pipeline_model_parallel_size,
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
+                create_gloo_process_groups=args.enable_gloo_process_groups,
+                high_priority_stream_groups=args.high_priority_stream_groups,
             )
             if args.rank == 0:
                 print(
@@ -357,7 +420,13 @@ def _init_autoresume():
         torch.distributed.barrier()
 
 
-def _set_random_seed(seed_, data_parallel_random_init=False, te_rng_tracker=False, inference_rng_tracker=False):
+def _set_random_seed(
+    seed_: int,
+    data_parallel_random_init: bool = False,
+    te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
+):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
@@ -369,7 +438,9 @@ def _set_random_seed(seed_, data_parallel_random_init=False, te_rng_tracker=Fals
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.device_count() > 0:
-            tensor_parallel.model_parallel_cuda_manual_seed(seed, te_rng_tracker, inference_rng_tracker)
+            tensor_parallel.model_parallel_cuda_manual_seed(
+                seed, te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng
+            )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 

@@ -1,12 +1,10 @@
-# Copyright (C) 2025 Intel Corporation
-
 import contextlib
 from typing import Optional
 
 import pytest
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.param_and_grad_buffer import partition_buckets
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -34,12 +32,12 @@ class TestMoEModel(torch.nn.Module):
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
             moe_grouped_gemm=moe_grouped_gemm,
-            add_bias_linear=False,
             moe_token_dispatcher_type='alltoall',
             expert_model_parallel_size=ep_size,
             expert_tensor_parallel_size=etp_size,
             bf16=True,
             params_dtype=torch.bfloat16,
+            add_bias_linear=False,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
@@ -66,6 +64,7 @@ def get_moe_model_and_buffers(
     use_distributed_optimizer: bool,
     overlap_grad_reduce: bool,
     average_in_collective: bool,
+    num_distributed_optimizer_instances: int,
 ):
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
@@ -73,6 +72,7 @@ def get_moe_model_and_buffers(
         overlap_grad_reduce=overlap_grad_reduce,
         bucket_size=bucket_size,
         average_in_collective=average_in_collective,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
     model = TestMoEModel(
         hidden_size=hidden_size,
@@ -85,8 +85,8 @@ def get_moe_model_and_buffers(
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=model
     )
-    assert len(model.dense_buffers) == 1
-    param_and_grad_buffer = model.dense_buffers[0]
+    assert len(model.buffers) == 1
+    param_and_grad_buffer = model.buffers[0]
     ep_param_and_grad_buffer = (
         model.expert_parallel_buffers[0] if len(model.expert_parallel_buffers) else None
     )
@@ -107,6 +107,7 @@ def get_moe_model_and_buffers(
 @pytest.mark.parametrize("average_in_collective", [False, True])
 @pytest.mark.parametrize("ep_size", [1, 2])
 @pytest.mark.parametrize("etp_size", [1, 2])
+@pytest.mark.parametrize("num_distributed_optimizer_instances", [1, 2])
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_grad_sync(
@@ -115,11 +116,18 @@ def test_grad_sync(
     average_in_collective: bool,
     ep_size: int,
     etp_size: int,
+    num_distributed_optimizer_instances: int,
 ):
     Utils.initialize_model_parallel(
-        expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size
+        expert_model_parallel_size=ep_size,
+        expert_tensor_parallel_size=etp_size,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
-    tensor_parallel.model_parallel_cuda_manual_seed(123)
+
+    if num_distributed_optimizer_instances > 1 and not use_distributed_optimizer:
+        pytest.skip(
+            "Multiple distributed optimizer instances requires distributed optimizer to be enabled"
+        )
 
     (
         model,
@@ -138,6 +146,7 @@ def test_grad_sync(
         use_distributed_optimizer=use_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
         average_in_collective=average_in_collective,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
 
     param_to_bucket_group = {}
@@ -155,7 +164,10 @@ def test_grad_sync(
     if (
         use_distributed_optimizer
         and (not average_in_collective)
-        and parallel_state.get_data_parallel_rank() != 0
+        and parallel_state.get_data_parallel_rank(
+            with_context_parallel=True, partial_data_parallel=True
+        )
+        != 0
     ):
         # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/data_parallel_word_size
         # When average_in_collective=False, the grad data is always first scaled by 1/data_parallel_word_size and then summed by AR/RS
@@ -172,7 +184,7 @@ def test_grad_sync(
         if (
             use_distributed_optimizer
             and (not average_in_collective)
-            and parallel_state.get_expert_data_parallel_rank() != 0
+            and parallel_state.get_expert_data_parallel_rank(partial_expert_data_parallel=True) != 0
         ):
             # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/EDP
             # When average_in_collective=False, the grad data is always first scaled by expert_data_parallel_size and then summed by AR/RS
@@ -198,7 +210,11 @@ def test_grad_sync(
             contextlib.nullcontext() if overlap_grad_reduce else pytest.raises(AssertionError)
         )
         finish_grad_sync_context = contextlib.nullcontext()
-        if param_idx < (len(bucket_group.params) - 1) and overlap_grad_reduce:
+        if (
+            param_idx < (len(bucket_group.params) - 1)
+            and overlap_grad_reduce
+            and num_distributed_optimizer_instances == 1
+        ):
             # Can't finish grad sync until all params have been registered ready.
             finish_grad_sync_context = pytest.raises(AssertionError)
 

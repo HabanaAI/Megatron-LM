@@ -169,10 +169,14 @@ def get_model_optim_rng_patterns_for_non_sharded(model_type):
             r"embedding.position_embeddings.weight",
             r"decoder.layers.+\d+.input_layernorm.weight",
             r"decoder.layers.+\d+.input_layernorm.bias",
+            r"decoder.layers.+\d+.self_attention.linear_qkv.norm.weight",
+            r"decoder.layers.+\d+.self_attention.linear_qkv.norm.bias",
             r"decoder.layers.+\d+.self_attention.linear_qkv.bias",
             r"decoder.layers.+\d+.self_attention.linear_proj.bias",
             r"decoder.layers.+\d+.pre_mlp_layernorm.weight",
             r"decoder.layers.+\d+.pre_mlp_layernorm.bias",
+            r"decoder.layers.+\d+.mlp.linear_fc1.norm.weight",
+            r"decoder.layers.+\d+.mlp.linear_fc1.norm.bias",
             r"decoder.layers.+\d+.mlp.linear_fc1.bias",
             r"decoder.layers.+\d+.mlp.linear_fc2.bias",
             r"decoder.final_layernorm.weight",
@@ -181,7 +185,9 @@ def get_model_optim_rng_patterns_for_non_sharded(model_type):
     elif model_type in ["MIXTRAL", "DEEPSEEK"]:
         return [
             r"decoder.layers.+\d+.input_layernorm.weight",
+            r"decoder.layers.+\d+.self_attention.linear_qkv.norm.weight",
             r"decoder.layers.+\d+.pre_mlp_layernorm.weight",
+            r"decoder.layers.+\d+.mlp.linear_fc1.norm.weight",
             r"decoder.final_layernorm.weight",
         ]
 

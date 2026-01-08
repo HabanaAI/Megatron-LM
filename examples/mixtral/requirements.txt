@@ -3,4 +3,4 @@ prettytable
 regex
 seaborn
 sentencepiece
-tensorboard==2.12
+tensorboard==2.20

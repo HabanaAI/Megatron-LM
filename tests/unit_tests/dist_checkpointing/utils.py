@@ -116,10 +116,9 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.ddp_average_in_collective = False
     args.tensor_model_parallel_size = tp
     args.pipeline_model_parallel_size = pp
-    args.encoder_tensor_model_parallel_size = 0
-    args.encoder_pipeline_model_parallel_size = 0
     args.enable_ft_package = False
     args.use_torch_fsdp2 = False
+    args.init_model_with_meta_device = False
     return args
 
 
@@ -153,10 +152,22 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.num_layers = NUM_LAYERS
     args.hidden_size = HIDDEN_SIZE
     args.num_attention_heads = NUM_ATTENTION_HEADS
+    args.ckpt_step = None
+    args.use_custom_fsdp = False
+    args.dist_ckpt_pre_mcore_014 = False
+    args.dist_ckpt_optim_fully_reshardable = False
+    args.distrib_optim_fully_reshardable_mem_efficient = False
 
 
 def setup_model_and_optimizer(
-    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True
+    seed,
+    tp,
+    pp,
+    initialize_fn=initialize_gpt_model,
+    bf16=True,
+    dist_opt=True,
+    use_custom_fsdp=False,
+    data_parallel_sharding_strategy="optim_grads_params",
 ):
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):

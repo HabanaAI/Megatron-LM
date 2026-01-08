@@ -1,5 +1,3 @@
-# Copyright (C) 2025 Intel Corporation
-
 import contextlib
 import math
 from typing import Optional
@@ -48,8 +46,8 @@ def get_model_and_buffers(
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=model
     )
-    assert len(model.dense_buffers) == 1
-    param_and_grad_buffer = model.dense_buffers[0]
+    assert len(model.buffers) == 1
+    param_and_grad_buffer = model.buffers[0]
     bucket_groups = model.bucket_groups
 
     return model, param_and_grad_buffer, bucket_groups

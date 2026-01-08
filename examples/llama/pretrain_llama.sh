@@ -13,10 +13,12 @@ TOKENIZER_MODEL=${HL_TOKENIZER_MODEL:-}
 TRANSFORMER_IMPL=${HL_TRANSFORMER_IMPL:-transformer_engine}
 # Parallelism variables
 NUM_NODES=${HL_NUM_NODES:-1}
+LM_EVAL=${HL_LM_EVAL:-0}
 DP=${HL_DP:-2}
 TP=${HL_TP:-2}
 PP=${HL_PP:-2}
 CP=${HL_CP:-1}
+CP_COMM_TYPE=${HL_CP_COMM_TYPE:-"p2p"}
 MICRO_BATCH_SIZE=${HL_MICRO_BATCH:-1} # batch_size
 EXIT_INTERVAL=${HL_EXIT_INTERVAL:-0}
 OUTPUT_DIR=${HL_RESULTS_DIR:-}
@@ -24,6 +26,8 @@ OUTPUT_DIR_PREFIX=${HL_RESULTS_DIR_PREFIX:-.}
 CHECKPOINT_SAVE=${HL_SAVE:-1}
 SAVE_INTERVAL=${HL_SAVE_INTERVAL:-2000}
 CKPT_FORMAT=${HL_CKPT_FORMAT:-torch} # torch, torch_dist and zarr
+CKPT_CONVERT_FORMAT=${HL_CKPT_CONVERT_FORMAT:-}
+CKPT_CONVERT_SAVE=${HL_CKPT_CONVERT_SAVE:-}
 USE_DISTRIBUTED_OPTIMIZER=${HL_USE_DISTRIBUTED_OPTIMIZER:-1}
 SAVE_DISTRIB_OPTIMIZER_METHOD=${HL_SAVE_DISTRIB_OPTIMIZER_METHOD:-serial_per_node}
 LOAD_DISTRIB_OPTIMIZER_METHOD=${HL_LOAD_DISTRIB_OPTIMIZER_METHOD:-serial_per_dp_groups}
@@ -63,7 +67,7 @@ USE_TORCH_COMPILE=${HL_USE_TORCH_COMPILE:-0}
 USE_TORCH_COMPILED_AUTOGRAD=${HL_USE_TORCH_COMPILED_AUTOGRAD:-0}
 TORCH_COMPILE_DISABLE=${HL_TORCH_COMPILE_DISABLE:-0}
 USE_REGIONAL_COMPILATION=${HL_USE_REGIONAL_COMPILATION:-0}
-USE_TE_CUSTOM_OP=${HL_USE_TE_CUSTOM_OP:-0}
+USE_TE_CUSTOM_OP=${HL_USE_TE_CUSTOM_OP:-$(( USE_TORCH_COMPILE && FP8 ))}
 ALLOW_UNSPEC_INT_ON_NN_MODULE=${HL_ALLOW_UNSPEC_INT_ON_NN_MODULE:-0}
 CACHE_SIZE_LIMIT=${HL_CACHE_SIZE_LIMIT:-0}
 USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
@@ -85,15 +89,17 @@ USE_CPU_INIT=${HL_USE_CPU_INIT:-0}
 TORCHRUN_MULTINODE=${HL_TORCHRUN_MULTINODE:-0}
 TORCHRUN_NODE_RANK=${HL_TORCHRUN_NODE_RANK:-0}
 TORCHRUN_MASTER_ADDR=${HL_TORCHRUN_MASTER_ADDR:-localhost}
+TE_DISABLE_TCOMPILE_ON_FUSED_ATTN=${HL_TE_DISABLE_TCOMPILE_ON_FUSED_ATTN:-0}
 SSH_PORT=${HL_SSH_PORT:-22}
 HNIC=${HL_HNIC:-0}
 
 # asserting that NUM_NODES is greater than 1 when HNIC is set to 1
 if [ "${HNIC}" = "1" ] && [ "${NUM_NODES}" -le 1 ]; then
-  echo "Exiting: Host Nic is enabled and NUM_NODES is not greater than 1"
+  echo "Exiting: Host NIC is enabled and NUM_NODES is not greater than 1"
   exit 1
 fi
-#Host NIC variables
+
+# Host NIC variables
 if [[ "${HNIC}" -eq "1"  ]]; then
     HCCL_OVER_OFI=${HL_HCCL_OVER_OFI:-1}
     HCCL_GAUDI_DIRECT=${HL_HCCL_GAUDI_DIRECT:-1}
@@ -266,8 +272,15 @@ if [[ $(( NUM_LAYERS % PP )) -ne 0 ]]; then
 fi
 
 # Paths
-SRC_PATH="${MEGATRON_LM_ROOT}/pretrain_gpt.py"
-DATA_PATH=${DATA_DIR}/${DATA_FILE_PREFIX}
+if [[ "${LM_EVAL}" -eq 0 ]]; then
+    SRC_PATH="${MEGATRON_LM_ROOT}/pretrain_gpt.py"
+else
+    SRC_PATH="${MEGATRON_LM_ROOT}/tasks/lm_harness/lm_evaluation_harness.py"
+    NO_LOAD_OPTIM=1
+    NO_LOAD_RNG=1
+fi   
+
+DATA_PATH=${DATA_DIR}/${DATA_FILE_PREFIX} 
 
 if [[ -z "${TOKENIZER_MODEL}" ]]; then
     TOKENIZER_MODEL="${DATA_DIR}/tokenizer.model"
@@ -344,7 +357,7 @@ if [[ "${LAUNCHER_TYPE}" = "mpirun" ]]; then
     [[ -n "${HL_PE}" ]] && __MAP_BY="socket:PE=${HL_PE}"
     [[ -n "${HL_PE}" ]] && [[ -n "${HL_PPR}" ]] && __MAP_BY="ppr:${HL_PPR}:socket:PE=${HL_PE}"
     if [[ -n "${__MAP_BY}" ]]; then
-        CMD="${CMD} --bind-to core --rank-by core --report-bindings --map-by ${__MAP_BY}"
+        CMD="${CMD} --bind-to core --rank-by slot --report-bindings --map-by ${__MAP_BY}"
     else
         CMD="${CMD} --bind-to none"
     fi
@@ -354,11 +367,11 @@ if [[ "${LAUNCHER_TYPE}" = "mpirun" ]]; then
     CMD="${CMD} -x PT_HPU_GPU_MIGRATION=${PT_HPU_GPU_MIGRATION}"
     CMD="${CMD} -x PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${FP8_ENFORCE_BF16_AMAX_REDUCTION}"
     CMD="${CMD} -x PT_TE_LIMIT_GRAPH_SIZE=${PT_TE_LIMIT_GRAPH_SIZE}"
+    CMD="${CMD} -x PT_TE_DISABLE_TCOMPILE_ON_FUSED_ATTN=${TE_DISABLE_TCOMPILE_ON_FUSED_ATTN}"
     CMD="${CMD} -x PT_HPU_LAZY_MODE=${USE_LAZY_MODE}"
     if [[ "${TORCH_COMPILE_DISABLE}" = "1" ]]; then
         CMD="${CMD} -x TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE}"
     fi
-    CMD="${CMD} -x PT_TE_CUSTOM_OP=${USE_TE_CUSTOM_OP}"
     IFS=',' read -ra ENV_FLAGS_ARR <<< "$ENV_FLAGS"
     for ENV_FLAG in "${ENV_FLAGS_ARR[@]}"; do
         CMD="${CMD} -x ${ENV_FLAG}"
@@ -378,6 +391,7 @@ elif [[ "${LAUNCHER_TYPE}" = "torchrun" ]]; then
     export PT_HPU_GPU_MIGRATION=${PT_HPU_GPU_MIGRATION}
     export PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${FP8_ENFORCE_BF16_AMAX_REDUCTION}
     export PT_TE_LIMIT_GRAPH_SIZE=${PT_TE_LIMIT_GRAPH_SIZE}
+    export PT_TE_DISABLE_TCOMPILE_ON_FUSED_ATTN=${TE_DISABLE_TCOMPILE_ON_FUSED_ATTN}
     export PT_HPU_LAZY_MODE=${USE_LAZY_MODE}
     if [[ "${HNIC}" -eq "1" ]]; then
         export HCCL_OVER_OFI=${HCCL_OVER_OFI}
@@ -387,7 +401,6 @@ elif [[ "${LAUNCHER_TYPE}" = "torchrun" ]]; then
     if [[ "${TORCH_COMPILE_DISABLE}" = "1" ]]; then
         export TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE}
     fi
-    export PT_TE_CUSTOM_OP=${USE_TE_CUSTOM_OP}
     IFS=',' read -ra ENV_FLAGS_ARR <<< "$ENV_FLAGS"
     for ENV_FLAG in "${ENV_FLAGS_ARR[@]}"; do
         export "${ENV_FLAG?}"
@@ -410,6 +423,7 @@ CMD="${CMD} \
     --tensor-model-parallel-size ${TP} \
     --pipeline-model-parallel-size ${PP} \
     --context-parallel-size ${CP} \
+    --cp-comm-type ${CP_COMM_TYPE} \
     --distributed-backend nccl \
     --seq-length ${MAX_SEQ_LEN} \
     --num-layers ${NUM_LAYERS} \
@@ -464,9 +478,10 @@ CMD="${CMD} \
     --data-path ${DATA_PATH} \
     --num-workers ${NUM_WORKERS} \
     --distributed-timeout-minutes 60 \
+    --use-te-custom-op ${USE_TE_CUSTOM_OP} \
     "
 
-# Custom op solution, enabled conpile from second mini batch and regional compilation when use TE custom op.
+# Custom op solution, enabled compile from second mini batch and regional compilation when use TE custom op.
 if [[ "${USE_TE_CUSTOM_OP}" -eq 1 ]]; then
     CMD="${CMD} --compile-from-sec-mini-batch 1"
     CMD="${CMD} --use-regional-compilation 1"
@@ -585,6 +600,11 @@ if [[ "${CHECKPOINT_SAVE}" -eq 1 ]]; then
         CMD="${CMD} --verify-checkpoint"
         CMD="${CMD} --verify-checkpoint-model-type LLAMA"
     fi
+fi
+if [[ -n "${CKPT_CONVERT_FORMAT}" ]]; then
+    CMD="${CMD} --ckpt-convert-format ${CKPT_CONVERT_FORMAT}"
+    CMD="${CMD} --ckpt-convert-save ${CKPT_CONVERT_SAVE}"
+    CMD="${CMD} --auto-detect-ckpt-format"
 fi
 
 if [[ "${OVERRIDE_OPT_PARAM_SCHEDULER}" -eq 1 && "${USE_CKPT_OPT_PARAM_SCHEDULER}" -eq 1 ]]; then

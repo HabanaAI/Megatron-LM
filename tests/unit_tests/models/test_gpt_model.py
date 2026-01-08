@@ -100,6 +100,7 @@ def test_get_mlp_module_spec_interface():
         "fp8_coverage": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "moe_dynamic_hpu": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "fp8_smooth_swiglu": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "use_te_op_fuser": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
     expected_defaults = {
@@ -111,6 +112,7 @@ def test_get_mlp_module_spec_interface():
         "fp8_coverage": dict(),
         "moe_dynamic_hpu": False,
         "fp8_smooth_swiglu": False,
+        "use_te_op_fuser": False,
     }
 
     # Check parameter kinds

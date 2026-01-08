@@ -9,6 +9,8 @@
 
 from typing import Callable, Optional
 
+import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import ModelParallelConfig, parallel_state
@@ -20,6 +22,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.rmsnorm import RMSNorm
@@ -47,8 +50,10 @@ except ImportError:
 try:
     import intel_transformer_engine as te
     from intel_transformer_engine.utils import is_gaudi3
-except:
+except Exception as e:
+
     print("Could not import Intel TE package")
+    print(f"Error details: {e}")
 
 
 def condition_init_method(config, init_method):
@@ -227,6 +232,7 @@ class IntelTEColumnParallelLinear(IntelTELinear):
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         if gather_output:
             raise ValueError('Transformer Engine linear layers do not support gather_output = True')
@@ -269,6 +275,7 @@ class IntelTERowParallelLinear(IntelTELinear):
         skip_bias_add: bool,
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
         **kwargs,
     ):
         if not input_is_parallel:
@@ -307,6 +314,104 @@ class IntelTERowParallelLinearFp8Disabled(IntelTERowParallelLinear):
         super().__init__(
             input_size=input_size, output_size=output_size, **kwargs, force_disable_fp8=True
         )
+
+
+class IntelTELayerNormColumnParallelLinear(IntelTELinear):
+    """
+    Convenience module that applies:
+        Column-Parallel Linear => Normalization (LayerNorm or RMSNorm)
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config: TransformerConfig,
+        init_method: Callable,
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        skip_weight_param_allocation: bool = False,
+        tp_comm_buffer_name: Optional[str] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            parallel_mode="column",
+            config=config,
+            init_method=condition_init_method(config, init_method),
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            is_expert=is_expert,
+        )
+
+        if gather_output:
+            raise ValueError(
+                "Intel Transformer Engine linear layers do not support gather_output = True"
+            )
+
+        if skip_weight_param_allocation:
+            raise ValueError(
+                "Transformer Engine linear layers do not support skip_weight_param_allocation"
+            )
+        if is_expert:
+            raise ValueError("IntelTEColParLinearNorm currently does not support MoE/expert mode")
+
+        self.te_return_bias = skip_bias_add and bias
+
+        # Column parallel linear layer
+        self.linear = IntelTEColumnParallelLinear(
+            input_size=input_size,
+            output_size=output_size,
+            config=config,
+            init_method=init_method,
+            gather_output=False,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            is_expert=is_expert,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+        )
+
+        # Normalization after linear
+        self.norm = IntelTENorm(config=config, hidden_size=input_size, eps=config.layernorm_epsilon)
+        self.config = config
+
+    def forward(self, x):
+        norm_out = self.norm(x)
+        out = self.linear(norm_out)
+        return out
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(in_features={self.linear.in_features}, "
+            f"out_features={self.linear.out_features}, bias={self.linear.use_bias})"
+        )
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Return sharded state dict for both linear and norm"""
+        sd = {}
+        # linear part
+        sd.update(
+            {
+                f"{prefix}linear.{k}": v
+                for k, v in self.linear.sharded_state_dict(
+                    prefix='', sharded_offsets=sharded_offsets, metadata=metadata
+                ).items()
+            }
+        )
+        # norm part (not sharded)
+        sd.update(
+            {
+                f"{prefix}norm.{k}": v
+                for k, v in self.norm.state_dict(prefix='', keep_vars=True).items()
+            }
+        )
+        return sd
 
 
 if is_habana_frameworks_min_version("1.22.0"):
@@ -503,6 +608,7 @@ if is_habana_frameworks_min_version("1.21.0.399"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             force_disable_fp8=False,
+            tp_group: Optional[torch.distributed.ProcessGroup] = None,
         ):
 
             super().__init__(
@@ -594,6 +700,7 @@ if is_habana_frameworks_min_version("1.21.0.399"):
             skip_bias_add: bool,
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
+            tp_group: Optional[torch.distributed.ProcessGroup] = None,
         ):
             super().__init__(
                 num_gemms=num_gemms,
@@ -613,6 +720,127 @@ else:
     IntelTEColumnParallelGroupedLinear = None
     IntelTERowParallelGroupedLinear = None
     IntelTERowParallelGroupedLinearFP8Disabled = None
+
+
+if is_habana_frameworks_min_version("1.23.0"):
+
+    class IntelTEMixtureOfExperts(te.MixtureOfExperts):
+        """
+        Wrapper for the Transformer-Engine's `MixtureOfExperts` layer.
+        """
+
+        def __init__(
+            self,
+            num_local_experts: int,
+            config: TransformerConfig,
+            use_fp8_smooth_swiglu: bool = False,
+        ) -> None:
+            self.is_first_microbatch = True
+
+            tp_group = get_expert_tensor_parallel_group(check_initialized=False)
+            tp_size = parallel_state.get_expert_tensor_parallel_world_size()
+            tp_rank = parallel_state.get_expert_tensor_parallel_rank()
+            ep_rank = parallel_state.get_expert_model_parallel_rank()
+            global_indices_offset = ep_rank * num_local_experts
+            global_expert_indices = list(
+                range(global_indices_offset, num_local_experts + global_indices_offset)
+            )
+            # global_expert_indices indicate MLPs processed on the local device
+            # i.e. with 8 experts EP=2, there're 2 groups:
+            # global_expert_indices=[0, 1, 2, 3] on ep_rank 0
+            # global_expert_indices=[4, 5, 6, 7] on ep_rank 1
+            expert_parallel = config.expert_model_parallel_size > 1
+
+            assert num_local_experts == len(
+                global_expert_indices
+            ), f"[ep={ep_rank}, tp={tp_rank}] local expert indices mismatch"
+            assert not config.add_bias_linear, (
+                "bias in the expert layer is not supported in IntelTEMixtureOfExperts yet, "
+                "please set '--disable-bias-linear' instead."
+            )
+            assert config.fp8, "IntelTEMixtureOfExperts supports only FP8 workflow."
+
+            # All are GLU activations
+            if config.activation_func == F.gelu:
+                activation_fn = 'gelu'
+            elif config.activation_func == F.relu:
+                activation_fn = 'relu'
+            elif config.activation_func == F.silu:
+                activation_fn = 'silu'
+            else:
+                raise ValueError(
+                    f"IntelTEMixtureOfExperts activation function supported: "
+                    "['gelu', 'relu', 'silu']"
+                )
+
+            fc1_output_size = config.ffn_hidden_size * num_local_experts
+            fc2_input_size = config.ffn_hidden_size * num_local_experts
+            fc1_output_size *= 2  # SwiGLU
+
+            fc1_output_size_per_partition = divide(fc1_output_size, tp_size)
+            fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
+            fc1_output_size_per_partition_per_expert = divide(
+                fc1_output_size_per_partition, num_local_experts
+            )
+            fc2_input_size_per_partition_per_expert = divide(
+                fc2_input_size_per_partition, num_local_experts
+            )
+
+            if config.moe_fused_weights:
+                fc1_shape = (fc1_output_size_per_partition_per_expert, config.hidden_size)
+                fc2_shape = (config.hidden_size, fc2_input_size_per_partition_per_expert)
+            else:
+                ffn_hidden_size_per_partition = divide(config.ffn_hidden_size, tp_size)
+                fc1_shape = (ffn_hidden_size_per_partition, config.hidden_size)
+                fc2_shape = (config.hidden_size, fc2_input_size_per_partition_per_expert)
+            if not config.moe_permuted_weights:
+                fc1_shape = (fc1_shape[1], fc1_shape[0])
+                fc2_shape = (fc2_shape[1], fc2_shape[0])
+
+            extra_kwargs = _get_extra_te_kwargs(config)
+            if expert_parallel:
+                extra_kwargs["rng_tracker_name"] = get_expert_parallel_rng_tracker_name()
+
+            super().__init__(
+                num_local_experts,
+                global_expert_indices,
+                fc1_shape,
+                fc2_shape,
+                config.moe_fused_weights,
+                config.moe_permuted_weights,
+                config.init_method,
+                config.output_layer_init_method,
+                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None,
+                expert_parallel=expert_parallel,
+                sequence_parallel=config.sequence_parallel,
+                tp_group=tp_group,
+                tp_size=tp_size,
+                activation=activation_fn,
+                scaled_swiglu=use_fp8_smooth_swiglu,
+                recompute=config.moe_layer_recompute,
+                **extra_kwargs,
+            )
+
+        # pylint: disable=missing-function-docstring
+        def forward(self, hidden_states: Tensor, router_weights: Tensor, indices: Tensor):
+            _is_first_microbatch = self.is_first_microbatch
+            out = super().forward(hidden_states, router_weights, indices, _is_first_microbatch)
+            self.is_first_microbatch = False
+
+            return out, None
+
+    class IntelTEMixtureOfExpertsSmoothSwiglu(IntelTEMixtureOfExperts):
+        """
+        Wrapper for the Transformer-Engine's `MixtureOfExperts` layer but specialized
+        for FP8 Smooth SwiGLU https://arxiv.org/pdf/2409.12517.
+        """
+
+        def __init__(self, num_local_experts: int, config: TransformerConfig) -> None:
+            super().__init__(num_local_experts, config, use_fp8_smooth_swiglu=True)
+
+else:
+    IntelTEMixtureOfExperts = None
+    IntelTEMixtureOfExpertsSmoothSwiglu = None
 
 
 class IntelTEDotProductAttention(te.FusedAttention):
@@ -635,6 +863,7 @@ class IntelTEDotProductAttention(te.FusedAttention):
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
+        model_comm_pgs: ModelCommProcessGroups = None,
         force_disable_fp8=not is_gaudi3(),
     ):
         self.config = config

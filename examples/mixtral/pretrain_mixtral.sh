@@ -39,7 +39,7 @@ HNIC=${HL_HNIC:-0}
 
 # asserting that NUM_NODES is greater than 1 when HNIC is set to 1
 if [ "${HNIC}" = "1" ] && [ "${NUM_NODES}" -le 1 ]; then
-  echo "Exiting: Host Nic is enabled and NUM_NODES is not greater than 1"
+  echo "Exiting: Host NIC is enabled and NUM_NODES is not greater than 1"
   exit 1
 fi
 #Host NIC variables
@@ -87,6 +87,9 @@ USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
 USE_TORCH_COMPILE=${HL_USE_TORCH_COMPILE:-0}
 USE_TORCH_COMPILED_AUTOGRAD=${HL_USE_TORCH_COMPILED_AUTOGRAD:-0}
 TORCH_COMPILE_DISABLE=${HL_TORCH_COMPILE_DISABLE:-0}
+USE_REGIONAL_COMPILATION=${HL_USE_REGIONAL_COMPILATION:-0}
+USE_TE_CUSTOM_OP=${HL_USE_TE_CUSTOM_OP:-0}
+ALLOW_UNSPEC_INT_ON_NN_MODULE=${HL_ALLOW_UNSPEC_INT_ON_NN_MODULE:-0}
 
 USE_FUSED_SDPA=${HL_USE_FUSED_SDPA:-1}
 USE_FUSED_SDPA_WITH_RECOMPUTE=${HL_USE_FUSED_SDPA_WITH_RECOMPUTE:-0}
@@ -100,6 +103,8 @@ RECOMPUTE_NUM_LAYERS=${HL_RECOMPUTE_NUM_LAYERS:-1}
 CHECKPOINT_SAVE=${HL_SAVE:-0}
 SAVE_INTERVAL=${HL_SAVE_INTERVAL:-2000}
 CKPT_FORMAT=${HL_CKPT_FORMAT:-torch} # torch, torch_dist and zarr
+CKPT_CONVERT_FORMAT=${HL_CKPT_CONVERT_FORMAT:-}
+CKPT_CONVERT_SAVE=${HL_CKPT_CONVERT_SAVE:-}
 OVERRIDE_OPT_PARAM_SCHEDULER=${HL_OVERRIDE_OPT_PARAM_SCHEDULER:-0}
 USE_CKPT_OPT_PARAM_SCHEDULER=${HL_USE_CKPT_OPT_PARAM_SCHEDULER:-0}
 NO_LOAD_STRICT=${HL_NO_LOAD_STRICT:-0}
@@ -128,6 +133,7 @@ FP8_FORMAT=${HL_FP8_FORMAT:-hybrid} # hybrid or e5m2
 FP8_MARGIN=${HL_FP8_MARGIN:-0}
 FP8_AMAX_COMPUTE_ALGO=${HL_FP8_AMAX_COMPUTE_ALGO:-max} # max or most_recent
 FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=False"}
+FP8_SMOOTH_SWIGLU=${HL_FP8_SMOOTH_SWIGLU:-0}
 FP8_FORCE_SEQ_MOE=${HL_FP8_FORCE_SEQ_MOE:-0}
 MOE_GROUPED_GEMM=${HL_MOE_GROUPED_GEMM:-0}
 
@@ -204,10 +210,6 @@ if [[ $MOE_NUM_CAPACITY_BINS -gt 0 && -n "$MOE_EXPERT_CAPACITY_FACTOR" ]]; then
     exit 1
 fi
 
-if [[ $MOE_DYNAMIC -eq 1 && $FP8 -eq 1 ]]; then
-        echo "Fused HPU kernel for MoE 'IntelDynamicMLP' supports FP32 and BF16 precision, got HL_FP8=1"
-        exit 1
-fi
 if [[ $MOE_DYNAMIC -eq 1 ]]; then
     MOE_PAD_EXPERT_INPUT_TO_CAPACITY=""
     MOE_TOKEN_DISPATCHER_TYPE=""
@@ -308,7 +310,7 @@ if [ "$LAUNCHER_TYPE" = "mpirun" ]; then
     [[ -n "$HL_PE" ]] && __MAP_BY="socket:PE=${HL_PE}"
     [[ -n "$HL_PE" ]] && [[ -n "${HL_PPR}" ]] && __MAP_BY="ppr:${HL_PPR}:socket:PE=${HL_PE}"
     if [[ -n "${__MAP_BY}" ]]; then
-        CMD="${CMD} --bind-to core --rank-by core --report-bindings --map-by ${__MAP_BY}"
+        CMD="${CMD} --bind-to core --rank-by slot --report-bindings --map-by ${__MAP_BY}"
     else
         CMD="${CMD} --bind-to none"
     fi
@@ -320,6 +322,7 @@ if [ "$LAUNCHER_TYPE" = "mpirun" ]; then
     if [ "${TORCH_COMPILE_DISABLE}" = "1" ]; then
         CMD="${CMD} -x TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE}"
     fi
+    CMD="${CMD} -x PT_TE_CUSTOM_OP=${USE_TE_CUSTOM_OP}"
     IFS=',' read -ra ENV_FLAGS_ARR <<< "$ENV_FLAGS"
     for ENV_FLAG in "${ENV_FLAGS_ARR[@]}"; do
         CMD="${CMD} -x ${ENV_FLAG}"
@@ -346,6 +349,7 @@ elif [ "$LAUNCHER_TYPE" = "torchrun" ]; then
     if [ "${TORCH_COMPILE_DISABLE}" = "1" ]; then
         export TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE}
     fi
+    export PT_TE_CUSTOM_OP=${USE_TE_CUSTOM_OP}
     IFS=',' read -ra ENV_FLAGS_ARR <<< "$ENV_FLAGS"
     for ENV_FLAG in "${ENV_FLAGS_ARR[@]}"; do
         export "${ENV_FLAG?}"
@@ -370,6 +374,7 @@ CMD="${CMD} \
     --transformer-impl ${TRANSFORMER_IMPL} \
     --use-torch-compile ${USE_TORCH_COMPILE} \
     --use-torch-compiled-autograd ${USE_TORCH_COMPILED_AUTOGRAD} \
+    --allow-unspec-int-on-nn-module ${ALLOW_UNSPEC_INT_ON_NN_MODULE} \
     --use-mcore-models \
     --disable-bias-linear \
     --seq-length ${SEQ_LEN} \
@@ -426,6 +431,14 @@ CMD="${CMD} \
     --verify-checkpoint-model-type MIXTRAL \
     "
 
+# Custom op solution, enabled conpile from second mini batch and regional compilation when use TE custom op.
+if [[ "${USE_TE_CUSTOM_OP}" -eq 1 ]]; then
+    CMD="${CMD} --compile-from-sec-mini-batch 1"
+    CMD="${CMD} --use-regional-compilation 1"
+else
+    CMD="${CMD} --use-regional-compilation ${USE_REGIONAL_COMPILATION}"
+fi
+
 # -------------
 # Precision fp32->bf16
 if [ $BF16 -eq 1 ]; then
@@ -434,7 +447,7 @@ fi
 
 # -------------
 # GroupedMLP
-if [ "$MOE_GROUPED_GEMM" -eq 1 ] || { [ "$FP8" -eq 1 ] && [ "$FP8_FORCE_SEQ_MOE" -eq 0 ]; }; then
+if [[ "$MOE_GROUPED_GEMM" -eq 1 || ( "$MOE_DYNAMIC" -eq 0 && "$FP8" -eq 1 && "$FP8_FORCE_SEQ_MOE" -eq 0 ) ]]; then
     CMD="${CMD} --moe-grouped-gemm"
 fi
 
@@ -523,7 +536,9 @@ if [ $CKP_ACT -eq 1 ]; then
 elif [ $CKP_ACT -eq 2 ]; then
     CMD="${CMD} --recompute-granularity selective"
 elif [ $CKP_ACT -eq 3 ]; then
-    CMD="${CMD} --moe-layer-recompute"
+    # Deprecated --moe-layer-recompute replaced by selective recompute of MoE layer
+    CMD="${CMD} --recompute-granularity selective"
+    CMD="${CMD} --recompute-modules moe"
 fi
 
 if [ $DIST_OPTIMIZER -eq 1 ]; then
@@ -554,6 +569,11 @@ if [ $CHECKPOINT_SAVE -eq 1 ]; then
     CMD="${CMD} --save ${CHECKPOINTS_DIR}"
     CMD="${CMD} --save-interval ${SAVE_INTERVAL}"
     CMD="${CMD} --ckpt-format ${CKPT_FORMAT}"
+fi
+if [[ -n "${CKPT_CONVERT_FORMAT}" ]]; then
+    CMD="${CMD} --ckpt-convert-format ${CKPT_CONVERT_FORMAT}"
+    CMD="${CMD} --ckpt-convert-save ${CKPT_CONVERT_SAVE}"
+    CMD="${CMD} --auto-detect-ckpt-format"
 fi
 
 if [[ $OVERRIDE_OPT_PARAM_SCHEDULER -eq 1 && $USE_CKPT_OPT_PARAM_SCHEDULER -eq 1 ]]; then
@@ -612,6 +632,10 @@ if [[ "${TRANSFORMER_IMPL}" == "transformer_engine" && $FP8 -eq 1 ]]; then
 
     if [[ "${FP8_AMAX_REDUCE}" -eq 1 ]]; then
         CMD="${CMD} --fp8-amax-reduce"
+    fi
+
+    if [[ "${FP8_SMOOTH_SWIGLU}" -eq 1 ]]; then
+        CMD="${CMD} --fp8-smooth-swiglu"
     fi
 fi
 

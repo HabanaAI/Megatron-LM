@@ -4,6 +4,7 @@ import os
 import time
 import urllib.request as req
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import mock
 import numpy as np
@@ -12,10 +13,27 @@ import torch
 
 import megatron.core.utils as util
 import megatron.training.utils as training_util
+from megatron.core import config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+success_string = "hello,world"
+
+
+@util.experimental_cls(introduced_with_version="0.1.0")
+class A:
+
+    def __init__(self):
+        pass
+
+    def some_method(self):
+        return success_string
+
+    @classmethod
+    def some_static_method(cls):
+        return success_string
 
 
 def test_divide_properly():
@@ -25,6 +43,41 @@ def test_divide_properly():
 def test_divide_improperly():
     with pytest.raises(AssertionError):
         util.divide(4, 5)
+
+
+def test_experimental_cls_init():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
+        # Check that initialization works
+        a = A()
+        assert a.__class__.__qualname__ == "A"
+        assert a.some_method() == success_string
+        assert a.is_experimental is True
+
+
+def test_experimental_cls_static():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
+        # Check that static methods work
+        assert A.__class__.__qualname__ == "A"
+        assert A.some_static_method() == success_string
+        assert A.is_experimental is True
+
+
+def test_experimental_cls_exception_init():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+        util.ExperimentalNotEnabledError
+    ):
+        a = A()
+        assert a.some_method() == success_string
+        assert a.is_experimental is False
+
+
+def test_experimental_cls_exception_static():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+        util.ExperimentalNotEnabledError
+    ):
+        assert A.some_static_method() == success_string
+
+    assert A.is_experimental is False
 
 
 def test_global_memory_buffer():
@@ -71,6 +124,62 @@ def _init_distributed(world, rank):
 def _deinit_distributed():
     assert torch.distributed.is_initialized() == True
     torch.distributed.barrier()
+
+
+@pytest.mark.parametrize(
+    "msg,suffix",
+    [(None, None), ("test_message", None), (None, "test_suffix"), ("test_message", "test_suffix")],
+)
+def test_nvtx_range(msg, suffix):
+    # Track function execution
+    execution_tracker = {'ranges': False}
+
+    def _call_nvtx_range():
+        util.nvtx_range_push(msg, suffix)
+        execution_tracker['ranges'] = True
+        util.nvtx_range_pop(msg, suffix)
+
+    # Test with NVTX disabled
+    util.configure_nvtx_profiling(False)
+    _call_nvtx_range()
+    assert execution_tracker['ranges']
+
+    # Reset tracker
+    execution_tracker['ranges'] = False
+
+    # Test with NVTX enabled
+    util.configure_nvtx_profiling(True)
+    _call_nvtx_range()
+    assert execution_tracker['ranges']
+
+
+def test_nvtx_decorator():
+    # Track function execution
+    execution_tracker = {'decorated': False, 'decorated_with_message': False}
+
+    # Create decorated functions
+    @util.nvtx_decorator()
+    def nvtx_decorated_function():
+        execution_tracker['decorated'] = True
+
+    @util.nvtx_decorator(message="test_nvtx_decorator", color="red")
+    def nvtx_decorated_function_with_message():
+        execution_tracker['decorated_with_message'] = True
+
+    # Test with NVTX disabled
+    util.configure_nvtx_profiling(False)
+    nvtx_decorated_function()
+    nvtx_decorated_function_with_message()
+    assert all(execution_tracker.values())
+
+    # Reset tracker
+    execution_tracker = {'decorated': False, 'decorated_with_message': False}
+
+    # Test with NVTX enabled
+    util.configure_nvtx_profiling(True)
+    nvtx_decorated_function()
+    nvtx_decorated_function_with_message()
+    assert all(execution_tracker.values())
 
 
 @pytest.mark.flaky_in_dev

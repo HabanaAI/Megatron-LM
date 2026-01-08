@@ -23,7 +23,7 @@ HNIC=${HL_HNIC:-0}
 
 # asserting that NUM_NODES is greater than 1 when HNIC is set to 1
 if [ "${HNIC}" = "1" ] && [ "${NUM_NODES}" -le 1 ]; then
-  echo "Exiting: Host Nic is enabled and NUM_NODES is not greater than 1"
+  echo "Exiting: Host NIC is enabled and NUM_NODES is not greater than 1"
   exit 1
 fi
 #Host NIC variables
@@ -207,7 +207,7 @@ if [[ "${LAUNCHER_TYPE}" = "mpirun" ]]; then
     [[ -n "${HL_PE}" ]] && __MAP_BY="socket:PE=${HL_PE}"
     [[ -n "${HL_PE}" ]] && [[ -n "${HL_PPR}" ]] && __MAP_BY="ppr:${HL_PPR}:socket:PE=${HL_PE}"
     if [[ -n "${__MAP_BY}" ]]; then
-        CMD="${CMD} --bind-to core --rank-by core --report-bindings --map-by ${__MAP_BY}"
+        CMD="${CMD} --bind-to core --rank-by slot --report-bindings --map-by ${__MAP_BY}"
     else
         CMD="${CMD} --bind-to none"
     fi
@@ -286,7 +286,7 @@ fi
 
 if [[ ${MOE_LAYER_RECOMPUTE} -eq 1 ]]; then
     MOE_ARGS="${MOE_ARGS} \
-        --moe-layer-recompute"
+        --recompute-granularity selective --recompute-modules moe"
 fi
 
 if [[ ${MOE_SKIP_FIRST_LAYERS} -gt 0 ]]; then

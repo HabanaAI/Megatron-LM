@@ -5,6 +5,8 @@ import json
 import os
 import sys
 import torch
+
+from utils import _ConverterFakeProcessGroup
 try:
     import transformers
 except ImportError:
@@ -23,8 +25,9 @@ def add_arguments(parser):
 
     # TODO(jbarker): Need assertion to make sure *exactly* one of these is used
     parser.add_argument('--model-size', type=str, required=True,
-                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3', 'mistral', 'yi-34B', 'qwen2.5'],
-                        help='Select model size/type')
+                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf', 'yi-34B', 'qwen2.5'],
+                        help='Model size can be `llama2-7B`, `llama2-13B`, `llama2-70B`, `llama3-8B`, `llama3-70B`, `mistral-7B` (for pretrained models), '
+                        'and `llama2-7Bf`, `llama2-13Bf`, `llama2-70Bf`, `llama3-8Bf`, `llama3-70bf` and `mistral-7Bf` (for chat-finetuned models).')
     parser.add_argument('--checkpoint-type', type=str, required=True,
                         choices=['meta', 'hf'],
                         help='Type of checkpoint to convert, options are "meta" or "hf"')
@@ -57,6 +60,13 @@ NUM_SHARDS = {
     "llama2-13Bf": 2,
     "llama2-70B": 8,
     "llama2-70Bf": 8,
+    "llama3-8B": 1,
+    "llama3-8Bf": 1,
+    "llama3-70B": 8,
+    "llama3-70Bf": 8,
+    "mistral-7B": 1,
+    "mistral-7Bf": 1,
+    "yi-34B": 8,
 }
 
 
@@ -77,9 +87,14 @@ def write_json(text, path):
 # This conversion is adapted from
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py
 def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
+
     if "llama2" in model_size:
         from transformers import LlamaConfig as ModelConfig
         from transformers import  LlamaTokenizer, LlamaTokenizerFast
+    elif "llama3" in model_size:
+        from transformers import LlamaConfig as ModelConfig
+    elif "mistral" in model_size:
+        from transformers import MistralConfig as ModelConfig
     else:
         raise NotImplementedError(f"converting {model_size} is only supported using HuggingFace weights")
 
@@ -102,18 +117,24 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     if base > 10000.0:
         max_position_embeddings = 32768 if "mistral" in model_size else 16384
     else:
-        max_position_embeddings = 4096
+        max_position_embeddings = 4096 if "mistral" in model_size else 2048
 
     if "llama2" in model_size:
         tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
+    elif model_size in ["llama3", "mistral"]:
+        tokenizer_class = transformers.AutoTokenizer.from_pretrained
     else:
         raise AttributeError(f"model_size={model_size} not supported")
-
     if tokenizer_path is not None:
-        if "llama2" in model_size:
+        if "llama" in model_size:
             tokenizer = tokenizer_class(tokenizer_path)
-            tokenizer.save_pretrained(model_path)
-            vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
+            if "llama2" in model_size:
+                tokenizer.save_pretrained(model_path)
+            vocab_size = tokenizer.vocab_size
+
+        elif "mistral" in model_size:
+            tokenizer = tokenizer_class.from_file(tokenizer_path)
+            vocab_size = 32768
         else:
             raise AttributeError(f"model_size={model_size} is not supported")
 
@@ -285,7 +306,6 @@ def load_args_from_checkpoint(args, model_size):
     model_args_path = os.path.join(args.load, "config.json")
     with open(model_args_path) as f:
         model_args = json.load(f)
-
     # Update Megatron args.
     args.seq_length = 4096
     if "llama2" in model_size:
@@ -330,8 +350,7 @@ def set_postprocess_state(args, model, hf_model):
             model.language_model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
     else:
         model.decoder.final_layernorm.weight.data.copy_(hf_model.model.norm.weight)
-        if args.untie_embeddings_and_output_weights:
-            model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
+        model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
 
 
 def set_attn_state(args, layer, hf_layer):
@@ -358,10 +377,11 @@ def set_attn_state(args, layer, hf_layer):
         ], dim=1).reshape((-1, args.hidden_size)))
         if args.add_qkv_bias:
             attn.query_key_value.bias.data.copy_(torch.cat([
-                hf_attn.q_proj.bias.reshape((ng, dim*nh//ng)),
-                hf_attn.k_proj.bias.reshape((ng, dim)),
-                hf_attn.v_proj.bias.reshape((ng, dim)),
-            ], dim=1).reshape(-1))
+	            hf_attn.q_proj.bias.reshape((ng, dim*nh//ng)),
+	            hf_attn.k_proj.bias.reshape((ng, dim)),
+	            hf_attn.v_proj.bias.reshape((ng, dim)),
+	        ], dim=1).reshape(-1))
+
         attn.dense.weight.data.copy_(hf_attn.o_proj.weight)
     else:
         attn.linear_qkv.weight.data.copy_(
@@ -374,12 +394,6 @@ def set_attn_state(args, layer, hf_layer):
                 dim=1,
             ).reshape((-1, args.hidden_size))
         )
-        if args.add_qkv_bias:
-            attn.linear_qkv.bias.data.copy_(torch.cat([
-                hf_attn.q_proj.bias.reshape((ng, dim*nh//ng)),
-                hf_attn.k_proj.bias.reshape((ng, dim)),
-                hf_attn.v_proj.bias.reshape((ng, dim)),
-            ], dim=1).reshape(-1))
         attn.linear_proj.weight.data.copy_(hf_attn.o_proj.weight)
 
 
@@ -433,9 +447,10 @@ def load_checkpoint_to_model(args):
     '''Set model params.'''
 
     from pretrain_gpt import model_provider
+    from transformers import AutoModelForCausalLM
 
     # Load Huggingface model.
-    hf_model = transformers.AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map=device)
+    hf_model = AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map=device)
 
     # Init Megatron model.
     model = model_provider(True, True).to(args.params_dtype).to(device)
@@ -470,7 +485,7 @@ def _load_checkpoint(queue, args):
 
     try:
         from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_global_variables
+        from megatron.training.global_vars import set_args, set_global_variables
         from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
@@ -557,8 +572,6 @@ def _load_checkpoint(queue, args):
 
     margs.position_embedding_type = "rope"
 
-    margs.position_embedding_type = "rope"
-
     def check_for_arg(arg_name, default=None):
         if getattr(margs, arg_name, None) is None:
             if default is not None:
@@ -586,6 +599,7 @@ def _load_checkpoint(queue, args):
     # Determine how to make our models.
     assert args.model_type == 'GPT', 'Llama-2, Llama-3 and Mistral are GPT models.'
     margs.model_type = ModelType.encoder_or_decoder
+    margs.params_dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
 
     # Suppress warning about torch.distributed not being initialized.
     module.MegatronModule.embedding_warning_printed = True
@@ -596,6 +610,11 @@ def _load_checkpoint(queue, args):
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     if is_real_cuda_device_available():
         fused_kernels.load(margs)
+    # For backward compatibility during local parallel states refactoring
+    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
+    fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
+    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+    mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
 
     # Short aliases.
     tp_size = margs.tensor_model_parallel_size
@@ -695,8 +714,6 @@ def _load_checkpoint(queue, args):
             dense_weight.append(layer.self_attention.linear_proj.weight.data)
             mlp_l0_weight.append(layer.mlp.linear_fc1.weight.data)
             mlp_l1_weight.append(layer.mlp.linear_fc2.weight.data)
-            if md.qkv_bias:
-                qkv_bias.append(layer.self_attention.linear_qkv.bias.data)
 
         if md.linear_bias:
             qkv_bias.append(layer.self_attention.query_key_value.bias.data if margs.use_legacy_models else layer.self_attention.linear_qkv.bias.data)
@@ -718,12 +735,14 @@ def _load_checkpoint(queue, args):
         message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
         if md.qkv_bias:
             message["qkv bias"] = torch.cat(qkv_bias, dim=0)
+
         if md.linear_bias:
+            message["qkv bias"] = torch.cat(qkv_bias, dim=0)
             if md.swiglu:
                 for tp_rank in range(tp_size):
                     mlp_l0_bias[tp_rank] = torch.chunk(mlp_l0_bias[tp_rank], 2, dim=0)
-                message["mlp l0 bias W"] = torch.cat([b[0] for b in mlp_l0_bias],dim=0)
-                message["mlp l0 bias V"] = torch.cat([b[1] for b in mlp_l0_bias],dim=0)
+                message["mlp l0 bias W"] = torch.cat([b[0] for b in mlp_l0_bias], dim=0)
+                message["mlp l0 bias V"] = torch.cat([b[1] for b in mlp_l0_bias], dim=0)
             else:
                 message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
 
@@ -742,7 +761,7 @@ def _load_checkpoint(queue, args):
     queue.put("done")
 
     if args.checkpoint_type == "meta":
-        shutil.rmtree(os.path.join(args.load_dir))
+        shutil.rmtree(os.path.join(args.save_dir, 'tmp'))
 
 
 def load_checkpoint(queue, args):

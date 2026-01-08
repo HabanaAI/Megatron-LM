@@ -1,5 +1,4 @@
 einops
-flask-restful
 junitparser
 mock
 numpy
@@ -10,11 +9,14 @@ pytest_mock
 scipy
 tiktoken
 wrapt
-flask-restful
 nltk
 pytest-random-order
 sentencepiece
 zarr
-tensorstore==0.1.45
+tensorstore!=0.1.46,!=0.1.72
 prettytable
 wandb
+transformers
+multi-storage-client
+boto3
+flask

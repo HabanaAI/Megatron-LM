@@ -115,7 +115,9 @@ def reduce_aux_losses_tracker_across_ranks(tracker: dict, track_names: Optional[
             torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
-                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
+                values,
+                group=tracker[name]['avg_group'],
+                op=torch.distributed.ReduceOp.AVG,
             )
 
 
@@ -132,6 +134,7 @@ def aux_losses_tracker_track_metrics(
     track_names: Optional[List[str]] = None,
     num_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
+    skip_cleanup: bool = False,
 ):
     """Track the aux losses for logging."""
     # Aux loss logging
@@ -192,4 +195,5 @@ def aux_losses_tracker_track_metrics(
                         iteration,
                     )
 
-    clear_aux_losses_tracker(tracker)
+    if not skip_cleanup:
+        clear_aux_losses_tracker(tracker)

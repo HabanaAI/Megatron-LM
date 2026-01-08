@@ -95,7 +95,7 @@ python $MEGATRON_LM_ROOT/tools/checkpoint/convert.py \
 --load-dir "/path/to/hf/checkpoints" \
 --save-dir "/path/to/save/mlm/checkpoint" \
 --tokenizer-model "/path/to/tokenizer/model" \
---model-size llama3
+--model-size llama3-70B
 ```
 
 ### [Mixtral] Usage

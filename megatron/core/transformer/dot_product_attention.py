@@ -1,4 +1,4 @@
-# © 2024-2025 Intel Corporation
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
@@ -12,14 +12,15 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.aux_loss import (
     AuxLossAutoScaler,
     aux_losses_tracker_save,
-    aux_losses_tracker_track_metrics,
+    aux_losses_tracker_track_metrics
 )
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import divide
 
@@ -51,6 +52,7 @@ class DotProductAttention(MegatronModule):
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
         cp_comm_type: str = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(config=config)
 
@@ -71,7 +73,16 @@ class DotProductAttention(MegatronModule):
         projection_size = self.config.kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        if model_comm_pgs is None:
+            # For backward compatibility, remove in v0.14 and raise error
+            # raise ValueError("DotProductAttention was called without ModelCommProcessGroups")
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp'])
+        else:
+            assert hasattr(
+                model_comm_pgs, 'tp'
+            ), "DotProductAttention model_comm_pgs must have tp process group"
+
+        world_size = model_comm_pgs.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
         self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
@@ -243,7 +254,7 @@ class DotProductAttention(MegatronModule):
 
             # calculate z-loss
             z_loss_coeff = self.z_loss_coeff / parallel_state.get_tensor_model_parallel_world_size()
-            z_loss = torch.mean(z**2) * z_loss_coeff
+            z_loss = torch.mean(z ** 2) * z_loss_coeff
 
             # divide by dp here and then use "reduce_group" to reduce-sum over dp group
             dp = parallel_state.get_data_parallel_world_size()
@@ -260,9 +271,7 @@ class DotProductAttention(MegatronModule):
         return scores
 
 
-def save_to_attention_z_loss_tracker(
-    name: str, loss: torch.Tensor, layer_number: int, config: TransformerConfig
-):
+def save_to_attention_z_loss_tracker(name: str, loss: torch.Tensor, layer_number: int, num_layers: int):
     """Save the attention z-loss tracker for logging.
     Args:
         name (str): The name of the loss.
@@ -271,16 +280,10 @@ def save_to_attention_z_loss_tracker(
         num_layers (int): The number of total layers.
     """
     tracker = parallel_state.get_attention_z_loss_tracker()
-    layer_offset = TransformerLayer._get_layer_offset(config)
+    layer_offset = get_transformer_layer_offset(num_layers)
     global_layer_number = layer_offset + layer_number
-    aux_losses_tracker_save(
-        tracker,
-        name,
-        loss,
-        global_layer_number,
-        config.num_layers,
-        reduce_group=parallel_state.get_data_parallel_group(),
-    )
+    aux_losses_tracker_save(tracker, name, loss, global_layer_number, num_layers,
+                            reduce_group=parallel_state.get_data_parallel_group())
 
 
 def track_attention_z_loss_metrics(
@@ -288,13 +291,5 @@ def track_attention_z_loss_metrics(
 ):
     """Track attention z_loss metrics"""
     tracker = parallel_state.get_attention_z_loss_tracker()
-    aux_losses_tracker_track_metrics(
-        tracker,
-        loss_scale,
-        iteration,
-        writer,
-        wandb_writer,
-        total_loss_dict,
-        per_layer_logging,
-        per_layer_prefix='attention_z_loss/',
-    )
+    aux_losses_tracker_track_metrics(tracker, loss_scale, iteration, writer, wandb_writer, total_loss_dict,
+                                     per_layer_logging, per_layer_prefix='attention_z_loss/')

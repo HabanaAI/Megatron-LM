@@ -6,14 +6,52 @@ import unittest.mock
 import numpy as np
 import pytest
 import torch
+from packaging.version import Version as PkgVersion
 
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.utils import is_real_cuda_device_available
 from megatron.inference.text_generation_server import MegatronServer
 from megatron.training import tokenizer
+from tests.unit_tests.inference.engines.test_static_engine import TestStaticInferenceEngine
 from tests.unit_tests.test_tokenizer import GPT2_VOCAB_SIZE, gpt2_tiktok_vocab
 from tests.unit_tests.test_utilities import Utils
 
 logitsT = torch.Tensor
+
+
+@pytest.fixture
+def static_inference_engine(gpt2_tiktoken_tokenizer):
+    engine = TestStaticInferenceEngine()
+
+    # Initialize engine with given tokenizer
+    engine.setup_engine(vocab_size=gpt2_tiktoken_tokenizer.vocab_size)
+    engine.static_engine.text_generation_controller.tokenizer = gpt2_tiktoken_tokenizer
+
+    # Mock model forward to comply with test expectations
+    original_forward = (
+        engine.static_engine.text_generation_controller.inference_wrapped_model.model.forward
+    )
+
+    def mocked_forward(*args, **kwargs):
+        tokens = args[0]
+        B, L = tokens.shape
+        assert B == 1, "Test assumes batch_size == 1"
+        V = gpt2_tiktoken_tokenizer.vocab_size
+        next_token_idxs = tokens[0, 1:]
+        logits = torch.zeros(1, L, V, dtype=torch.float32, device=tokens.device)
+        idx = torch.arange(L - 1)
+        if not is_real_cuda_device_available():
+            idx = idx.to(tokens.device)
+        logits[0, idx, next_token_idxs] = 100
+        logits[0, -1, gpt2_tiktoken_tokenizer.eos] = 100
+        logits[0, -1, gpt2_tiktoken_tokenizer.eos] = 100
+        return logits
+
+    engine.static_engine.text_generation_controller.inference_wrapped_model.model.forward = (
+        mocked_forward
+    )
+
+    yield engine.static_engine
 
 
 @pytest.fixture
@@ -30,10 +68,7 @@ def forward_step_wrapper(gpt2_tiktoken_tokenizer):
         V = gpt2_tiktoken_tokenizer.vocab_size
         next_token_idxs = tokens[0, 1:]
         logits = torch.zeros(1, L, V, dtype=torch.float32, device=tokens.device)
-        idx = torch.arange(L - 1)
-        if not is_real_cuda_device_available():
-            idx = idx.to(tokens.device)
-        logits[0, idx, next_token_idxs] = 100
+        logits[0, torch.arange(L - 1), next_token_idxs] = 100
         logits[0, -1, gpt2_tiktoken_tokenizer.eos] = 100
         return logits
 
@@ -41,8 +76,8 @@ def forward_step_wrapper(gpt2_tiktoken_tokenizer):
 
 
 @pytest.fixture
-def app():
-    server = MegatronServer(None)
+def app(static_inference_engine):
+    server = MegatronServer(static_inference_engine)
     return server.app
 
 
@@ -51,7 +86,6 @@ def client(app):
     return app.test_client()
 
 
-@pytest.mark.internal
 @unittest.mock.patch('megatron.inference.endpoints.completions.get_tokenizer')
 @unittest.mock.patch('megatron.inference.endpoints.completions.send_do_generate')
 @unittest.mock.patch('megatron.inference.text_generation.generation.get_args')
@@ -116,5 +150,6 @@ def test_completions(
     response = client.put('/completions', json=request_data)
     assert response.status_code == 405  # Method Not Allowed
 
-    mock_get_tokenizer1.assert_called()
+    if PkgVersion(mcore_version).minor < PkgVersion("0.13").minor:
+        mock_get_tokenizer1.assert_called()
     mock_send_do_generate.assert_called_once()

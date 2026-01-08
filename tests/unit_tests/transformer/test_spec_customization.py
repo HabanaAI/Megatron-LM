@@ -1,28 +1,33 @@
-# © 2024-2025 Intel Corporation
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import sys
 from dataclasses import dataclass, fields
+from importlib.metadata import version
 
-import pytest
 import torch
-
 try:
     import transformer_engine as te
+except:
+    pass
+from pkg_resources import packaging
 
-    from megatron.core.extensions.transformer_engine import (
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+try:
+    from megatron.core.transformer.custom_layers.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TENorm,
         TERowParallelLinear,
     )
-
     HAVE_TE = True
 except:
     HAVE_TE = False
-
 try:
-    from megatron.core.extensions.intel_transformer_engine import (
+    from megatron.core.transformer.custom_layers.intel_transformer_engine import (
         IntelTEColumnParallelLinear,
         IntelTEDotProductAttention,
         IntelTENorm,
@@ -30,11 +35,6 @@ try:
     )
 except:
     pass
-
-from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -42,7 +42,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module, impor
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -62,9 +61,7 @@ class TestSpecCustomization:
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
-                linear_qkv=(
-                    TELayerNormColumnParallelLinear if HAVE_TE else IntelTEColumnParallelLinear
-                ),  # TODO: Norm layer missing - not same
+                linear_qkv=TELayerNormColumnParallelLinear if HAVE_TE else IntelTEColumnParallelLinear, # TODO: Norm layer missing - not same
                 core_attention=TEDotProductAttention if HAVE_TE else IntelTEDotProductAttention,
                 linear_proj=TERowParallelLinear if HAVE_TE else IntelTERowParallelLinear,
                 q_layernorm=IdentityOp,
@@ -75,11 +72,11 @@ class TestSpecCustomization:
         # specify layernorm spec with module path to test dynamic importing
         if HAVE_TE:
             self.layernorm_spec = ModuleSpec(
-                module=("megatron.core.extensions.transformer_engine", "TENorm")
+                module=("megatron.core.transformer.custom_layers.transformer_engine", "TENorm"),
             )
         else:
             self.layernorm_spec = ModuleSpec(
-                module=("megatron.core.extensions.intel_transformer_engine", "IntelTENorm")
+                module=("megatron.core.transformer.custom_layers.intel_transformer_engine", "IntelTENorm"),
             )
 
         # specify bias dropout add with module path
@@ -122,7 +119,7 @@ class TestSpecCustomization:
         assert x == random_input
 
         # Check SelfAttention
-        self_attention = build_module(self.attention_spec, config=self.config, layer_number=1)
+        self_attention = build_module(self.attention_spec, config=self.config, layer_number=1,)
         assert isinstance(self_attention, SelfAttention)
         assert self_attention.layer_number == 1
         assert self_attention.attn_mask_type == self.attention_spec.params['attn_mask_type']
@@ -159,7 +156,8 @@ class TestSpecCustomization:
         assert id(bda_op) == id(get_bias_dropout_add)
 
     def test_sliding_window_attention(self):
-        if not is_te_min_version("1.2.0"):
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version < packaging.version.Version("1.2.0"):
             print("SWA not tested because TE version is not >= 1.2.0", file=sys.stderr)
             return
 

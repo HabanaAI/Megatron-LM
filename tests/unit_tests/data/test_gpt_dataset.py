@@ -48,6 +48,7 @@ def test_mock_gpt_dataset():
         reset_attention_mask=True,
         eod_mask_loss=True,
         tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
     )
 
     datasets = BlendedMegatronDatasetBuilder(
@@ -82,6 +83,7 @@ def test_mock_gpt_dataset():
         drop_last_partial_validation_sequence=False,
         add_extra_token_to_sequence=False,
         tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
     )
 
     datasets = BlendedMegatronDatasetBuilder(

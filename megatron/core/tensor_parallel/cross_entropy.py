@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 from typing import Tuple

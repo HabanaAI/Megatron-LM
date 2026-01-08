@@ -33,7 +33,6 @@ PP=${HL_PP:-16}
 USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
 
 export PT_HPU_LAZY_MODE=$USE_LAZY_MODE
-
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 
     --nnodes $NUM_NODES 

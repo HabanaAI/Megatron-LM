@@ -223,6 +223,14 @@ def merge_transformers_sharded_states(path, num_checkpoints):
     return state_dict
 
 
+def repair_state_dict(state_dict):
+    in_state_dict = state_dict
+    out_state_dict = {}
+    for src_key in in_state_dict.keys():
+        dest_key = src_key.replace("_orig_mod.", '') if "orig_mod." in src_key else src_key
+        out_state_dict[dest_key] = in_state_dict[src_key]
+    return out_state_dict
+
 def get_megatron_sharded_states(
     load_path: str,
     tp_size: int,
@@ -266,6 +274,8 @@ def get_megatron_sharded_states(
             raise FileNotFoundError(f"Checkpoint not found in {checkpoint_path}")
 
         state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if 'model' in state_dict:
+            state_dict['model'] = repair_state_dict(state_dict['model'])
 
         tp_state_dicts.append(state_dict)
 
@@ -723,10 +733,9 @@ def convert_checkpoint_from_megatron_to_transformers(args):
         ep_rank = 0
 
         # TODO: add support for expert_tensor_parallel
-        assert not megatron_args.moe_extended_tp, "MoE extended TP is currently not supported for conversion."
         assert megatron_args.expert_tensor_parallel_size == megatron_args.tensor_model_parallel_size, "Expert tensor parallel size different than tensor parallel size is currently not supported."
 
-        moe_tp = megatron_args.moe_extended_tp
+        moe_tp = False # expert_tensor_parallel size != tensor_parallel_size is currently not supported for conversion
     else:
         ep_size = None
         ep_rank = None

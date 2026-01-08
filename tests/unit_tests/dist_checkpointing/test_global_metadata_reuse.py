@@ -15,13 +15,6 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-try:
-    import nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver
-
-    has_nvrx = True
-except ModuleNotFoundError:
-    has_nvrx = False
-
 
 class TestGlobalMetadataReuse:
     def setup_method(self, method):
@@ -31,7 +24,6 @@ class TestGlobalMetadataReuse:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
-    @pytest.mark.skipif(not has_nvrx, reason="Caching requires NVRX v0.3 or newer.")
     def test_global_metadata_reuse(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0
@@ -39,12 +31,12 @@ class TestGlobalMetadataReuse:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
-        with TempNamedDir(
-            tmp_path_dist_ckpt / "test_global_metadata_reuse"
-        ) as non_persistent_ckpt_dir, mock.patch(
-            'megatron.training.checkpointing.get_args', new=lambda: mock_args
-        ), mock.patch(
-            "megatron.training.checkpointing.update_num_microbatches"
+        with (
+            TempNamedDir(
+                tmp_path_dist_ckpt / "test_global_metadata_reuse"
+            ) as non_persistent_ckpt_dir,
+            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
@@ -102,7 +94,6 @@ class TestGlobalMetadataReuse:
             assert resume_ckpt_context['save_strategy'].validated_loaded_metadata_reuse
 
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
-    @pytest.mark.skipif(not has_nvrx, reason="Caching requires NVRX v0.3 or newer.")
     def test_no_global_metadata_reuse_on_different_parallelism(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0
@@ -110,18 +101,20 @@ class TestGlobalMetadataReuse:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
-        with TempNamedDir(
-            tmp_path_dist_ckpt / "test_global_metadata_reuse"
-        ) as non_persistent_ckpt_dir, mock.patch(
-            'megatron.training.checkpointing.get_args', new=lambda: mock_args
-        ), mock.patch(
-            "megatron.training.checkpointing.update_num_microbatches"
+        with (
+            TempNamedDir(
+                tmp_path_dist_ckpt / "test_global_metadata_reuse"
+            ) as non_persistent_ckpt_dir,
+            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
             mock_args.non_persistent_ckpt_type = "global"
             mock_args.ckpt_assume_constant_structure = True
             mock_args.ckpt_fully_parallel_save = True
+            # We need full reshardability as we change TP/PP
+            mock_args.dist_ckpt_optim_fully_reshardable = True
 
             save_ckpt_context = {}
 

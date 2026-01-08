@@ -235,7 +235,7 @@ def save_checkpoint(queue, args):
     for attr in margs_attributes:
         if hasattr(md.checkpoint_args, attr):
             setattr(margs, attr, getattr(md.checkpoint_args, attr))
-    
+
     # Sequence parallel is required if use both tensor-parallel and Moe.
     if margs.num_experts is not None and args.target_tensor_parallel_size is not None:
         if margs.num_experts > 1 and args.target_tensor_parallel_size > 1:
@@ -346,6 +346,13 @@ def save_checkpoint(queue, args):
         if models[pp_rank][ep_rank][tp_rank] is None:
             pre_process = True if pp_rank == 0 else False
             post_process = True if pp_rank == args.target_pipeline_parallel_size - 1 else False
+
+            # Pass vocab size per TP shard to model_provider
+            full_vocab_size = md.true_vocab_size
+            tp_size = args.target_tensor_parallel_size
+            vocab_size_per_shard = (full_vocab_size + tp_size - 1) // tp_size
+            margs.padded_vocab_size = vocab_size_per_shard
+
             models[pp_rank][ep_rank][tp_rank] = model_provider(pre_process, post_process).to(device).to(
                 md.params_dtype
             )
@@ -422,7 +429,7 @@ def save_checkpoint(queue, args):
 
             if margs.num_experts:
                 router = msg.pop("router weight")
-            
+
             if hasattr(args, "load_capacity_bins") and args.load_capacity_bins:
                 bins_usage = msg.pop("bins usage")
                 total_requested_capacity = msg.pop("total requested capacity")

@@ -1,7 +1,7 @@
 # LLaMa for PyTorch
 
 This directory provides examples of the GPT-based LLaMa models training in the Megatron-LM repository on Intel® Gaudi® 2 & Gaudi® 3 AI accelerators.
-Before you get started, make sure to review the [Supported Configurations](../../README.md#supported-configurations).
+Before you get started, make sure to review the [Supported Configuration](../../README.md#supported-configuration).
 
 ## Table of Contents
 * [Setup](#setup)
@@ -16,7 +16,7 @@ to set up the environment including the `$PYTHON` environment variable. To achie
 The guides will walk you through the process of setting up your system to run the model on Gaudi 2 & Gaudi 3.
 
 ## How to Use
-Users bear sole liability and responsibility to follow and comply with any third party licenses, and Intel Corporation disclaims and will bear no liability with respect to users’ use or compliance with third party licenses.
+Users bear sole liability and responsibility to follow and comply with any third party licenses, and Habana Labs disclaims and will bear no liability with respect to users’ use or compliance with third party licenses.
 * Third-Party Models
   * In the course of using Megatron-LM, users may choose to download models created and distributed by third parties after reviewing background information about the models and agreeing to the license governing those models.
   * Notice: Intel does not create the content and does not warrant its accuracy or quality. By accessing the third-party content, or using materials trained on or with such content, you are indicating your acceptance of the terms associated with that content and warranting that your use complies with the applicable license.
@@ -367,3 +367,4 @@ Note: `HL_USE_LAZY_MODE=0` will run in mixed mode with eager and compile due to 
 
 # Known Issues
 * Only scripts and configurations mentioned in this README are supported and verified.
+* Accuracy issues may be observed when training in fp8 precision on Gaudi3.

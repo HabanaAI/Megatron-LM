@@ -19,6 +19,11 @@ class ModelParallelConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
+    pipeline_model_parallel_comm_backend: Optional[str] = None
+    """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
+       If None, the default backend will be used.
+    """
+
     pipeline_model_parallel_size: int = 1
     """Inter-layer model parallelism. Splits transformer layers across GPU ranks."""
 
@@ -212,6 +217,11 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
+    cross_entropy_fusion_impl: str = 'native'
+    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
+       from Transformer Engine library is used. Defaults to 'native'.
+    """
+
     tp_comm_overlap_disable_qkv: bool = False
     """
        If true, the AllGather -> Gemm overlap for QKV gets disabled
@@ -301,6 +311,9 @@ class ModelParallelConfig:
        rank 0 | 0 1 2 0 1 2 3 4 3 4 
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
+
+    delay_wgrad_compute: bool = False
+    """If true, delay the wgrad compute for better overlapping in combined 1F1B."""
 
     ###################
     # CPU Offloading

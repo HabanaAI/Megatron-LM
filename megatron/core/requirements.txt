@@ -2,5 +2,5 @@ numpy
 packaging
 pybind11
 torch
-tensorstore==0.1.45
+tensorstore!=0.1.46,!=0.1.72
 zarr

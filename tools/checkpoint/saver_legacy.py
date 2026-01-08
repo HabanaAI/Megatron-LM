@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Intel Corporation
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import os
@@ -116,9 +116,7 @@ def save_checkpoint(queue, args):
                 '--no-save-rng',
                 '--no-initialization',
                 '--save-interval', '1',
-                '--save', args.save_dir,
-                '--ckpt-format', 'torch', # only 'torch' supported for conversion
-                '--no-one-logger',
+                '--save', args.save_dir
                 ]
 
     if md.make_vocab_size_divisible_by is not None:
@@ -153,9 +151,8 @@ def save_checkpoint(queue, args):
                         'encoder_num_layers', 'encoder_seq_length',
                         'distribute_saved_activations',
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
-                        'start_weight_decay', 'end_weight_decay', 'bf16', 'fp16',
-                        'ckpt_format',
-        ]
+                        'start_weight_decay', 'end_weight_decay', 'bf16', 'fp16']
+
 
         for arg, value in vars(md.checkpoint_args).items():
             if arg in args_to_keep:
@@ -299,9 +296,8 @@ def save_checkpoint(queue, args):
             else:
                 mlp_l0_weight = torch.chunk(msg.pop("mlp l0 weight"), args.target_tensor_parallel_size, dim=0)
 
-            if md.qkv_bias:
-                qkv_bias = torch.chunk(msg.pop("qkv bias"), args.target_tensor_parallel_size, dim=0)
             if md.linear_bias:
+                qkv_bias = torch.chunk(msg.pop("qkv bias"), args.target_tensor_parallel_size, dim=0)
                 if md.swiglu:
                     mlp_l0_bias_W = torch.chunk(msg.pop("mlp l0 bias W"), args.target_tensor_parallel_size, dim=0)
                     mlp_l0_bias_V = torch.chunk(msg.pop("mlp l0 bias V"), args.target_tensor_parallel_size, dim=0)
@@ -322,9 +318,8 @@ def save_checkpoint(queue, args):
                     l.post_attention_norm.bias.data.copy_(post_norm_bias)
                 l.mlp.dense_h_to_4h.weight.data.copy_(mlp_l0_weight[tp_rank])
                 l.mlp.dense_4h_to_h.weight.data.copy_(mlp_l1_weight[tp_rank])
-                if md.qkv_bias:
-                    l.self_attention.query_key_value.bias.data.copy_(qkv_bias[tp_rank])
                 if md.linear_bias:
+                    l.self_attention.query_key_value.bias.data.copy_(qkv_bias[tp_rank])
                     l.self_attention.dense.bias.data.copy_(dense_bias)
                     l.mlp.dense_h_to_4h.bias.data.copy_(mlp_l0_bias[tp_rank])
                     l.mlp.dense_4h_to_h.bias.data.copy_(mlp_l1_bias)

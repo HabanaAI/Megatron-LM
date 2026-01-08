@@ -1,4 +1,4 @@
-# © 2024-2025 Intel Corporation
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
@@ -14,8 +14,8 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
-from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -27,13 +27,13 @@ _PAD_TOKEN_ID = -1
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets"""
 
-    reset_position_ids: bool = None
+    reset_position_ids: Optional[bool] = None
     """Option to reset the position IDs in the dataset at an interval"""
 
-    reset_attention_mask: bool = None
+    reset_attention_mask: Optional[bool] = None
     """Option to reset the attention mask from the dataset"""
 
-    eod_mask_loss: bool = None
+    eod_mask_loss: Optional[bool] = None
     """Option to enable the EOD mask loss"""
 
     create_attention_mask: bool = True
@@ -49,8 +49,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        output tokens are both of the desired sequence length
     """
 
-    s3_cache_path: str = None
-    """Path for caching indices for s3 dataloading."""
+    object_storage_cache_path: Optional[str] = None
+    """Path for caching indices for s3 or msc dataloading."""
 
     shuffle_each_epoch_separately: bool = False
     """Option to shuffle the dataset for each epoch separately.
@@ -148,12 +148,15 @@ class GPTDataset(MegatronDataset):
         Returns:
             IndexedDataset: The underlying IndexedDataset
         """
-        if is_s3_path(dataset_path):
+        if is_object_storage_path(dataset_path):
+            assert config.object_storage_cache_path is not None
             return IndexedDataset(
                 dataset_path,
                 multimodal=False,
                 mmap=config.mmap_bin_files,
-                s3_config=S3Config(path_to_idx_cache=config.s3_cache_path),
+                object_storage_config=ObjectStorageConfig(
+                    path_to_idx_cache=config.object_storage_cache_path
+                ),
             )
         return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
 
@@ -373,9 +376,7 @@ class GPTDataset(MegatronDataset):
             sequence_length = self.config.sequence_length
             num_tokens_per_epoch = self._get_num_tokens_per_epoch()
             num_epochs = self._get_num_epochs(num_tokens_per_epoch)
-            shuffle_each_epoch_separately = (
-                self.config.shuffle_each_epoch_separately and num_epochs > 1
-            )
+            shuffle_each_epoch_separately = self.config.shuffle_each_epoch_separately and num_epochs > 1
 
             if num_epochs == 1:
                 separate_final_epoch = False
@@ -413,9 +414,7 @@ class GPTDataset(MegatronDataset):
                 )
 
             log_single_rank(
-                logger,
-                logging.DEBUG,
-                f"> shuffle_each_epoch_separately: {shuffle_each_epoch_separately}",
+                logger, logging.DEBUG, f"> shuffle_each_epoch_separately: {shuffle_each_epoch_separately}"
             )
 
             log_single_rank(
@@ -424,87 +423,55 @@ class GPTDataset(MegatronDataset):
 
             numpy_random_state = numpy.random.RandomState(self.config.random_seed)
 
+            # Build the document index
+            document_index = _build_document_index(
+                self.indices, num_epochs, numpy_random_state, separate_final_epoch
+            )
+
             drop_last_partial_sequence = True
             if self.index_split == Split.valid:
                 drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
 
-            assert self.dataset.sequence_lengths.dtype == numpy.int32
-
-            def get_sequence_lengths_for_cpp(_document_index):
-                if len(_document_index) * 2 > len(self.dataset.sequence_lengths):
-                    # Heuristic: if "access density" of sequence_lengths is relatively high,
-                    # force loading the mmap-ed array into memory by taking a copy.
-                    # System performance benefits come from two aspects:
-                    # 1. **sequentially** pre-loading the whole file if we're gonna read a large fraction anyways.
-                    # 2. GIL is held when calling into c++ code; making the c++ func faster improves parallelism.
-                    _sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
-                else:
-                    _sequence_lengths_for_cpp = self.dataset.sequence_lengths
-                return _sequence_lengths_for_cpp
-
+            # Build the sample index
             from megatron.core.datasets import helpers
 
-            if shuffle_each_epoch_separately:
-                doc_idx_epochs, sample_idx_epochs, shuffle_idx_epochs = [], [], []
-                for _ in range(num_epochs):
-                    doc_idx_for_1epoch = _build_document_index(
-                        self.indices, 1, numpy_random_state, False
-                    )
-                    assert doc_idx_for_1epoch.dtype == numpy.int32
-
-                    # Build the sample index
-                    sequence_lengths_for_cpp = get_sequence_lengths_for_cpp(doc_idx_for_1epoch)
-                    sample_idx = helpers.build_sample_idx(
-                        sequence_lengths_for_cpp,
-                        doc_idx_for_1epoch,
-                        sequence_length,
-                        1,
-                        num_tokens_per_epoch,
-                        drop_last_partial_sequence,
-                        self.config.add_extra_token_to_sequence,
-                    )
-
-                    # Build the shuffle index
-                    shuffle_idx = _build_shuffle_index(
-                        sample_idx.shape[0] - 1, sample_idx.shape[0] - 1, numpy_random_state
-                    )
-
-                    doc_idx_epochs.append(doc_idx_for_1epoch)
-                    sample_idx_epochs.append(sample_idx)
-                    shuffle_idx_epochs.append(shuffle_idx)
-
-                # concat all epochs togather
-                document_index = numpy.concatenate(doc_idx_epochs)
-                sample_index = numpy.concatenate(sample_idx_epochs)
-                shuffle_index = numpy.concatenate(shuffle_idx_epochs)
+            if self.index_split == Split.valid:
+                drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
             else:
-                # Build the document index
-                document_index = _build_document_index(
-                    self.indices, num_epochs, numpy_random_state, separate_final_epoch
-                )
-                assert document_index.dtype == numpy.int32
+                drop_last_partial_sequence = True
 
-                # Build the sample index
-                sequence_lengths_for_cpp = get_sequence_lengths_for_cpp(document_index)
-                sample_index = helpers.build_sample_idx(
-                    sequence_lengths_for_cpp,
-                    document_index,
-                    sequence_length,
-                    num_epochs,
-                    num_tokens_per_epoch,
-                    drop_last_partial_sequence,
-                    self.config.add_extra_token_to_sequence,
-                )
+            assert document_index.dtype == numpy.int32
+            assert self.dataset.sequence_lengths.dtype == numpy.int32
+            if len(document_index) * 2 > len(self.dataset.sequence_lengths):
+                # If "access density" of sequence_lengths is high, force load the mmap-ed array
+                # into memory by making a copy.
+                #
+                # System performance benefits come from two aspects:
+                #   1. We sequentially pre-load the whole file, most of which we expect to read
+                #   2. The GIL is held when entering the c++ program, improving the speed of which
+                #      improves parallelism
+                sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
+            else:
+                sequence_lengths_for_cpp = self.dataset.sequence_lengths
+            sample_index = helpers.build_sample_idx(
+                sequence_lengths_for_cpp,
+                document_index,
+                sequence_length,
+                num_epochs,
+                num_tokens_per_epoch,
+                drop_last_partial_sequence,
+                self.config.add_extra_token_to_sequence,
+            )
 
-                # Build the shuffle index
-                if separate_final_epoch:
-                    shuffle_index = _build_shuffle_index(
-                        num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
-                    )
-                else:
-                    shuffle_index = _build_shuffle_index(
-                        sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
-                    )
+            # Build the shuffle index
+            if separate_final_epoch:
+                shuffle_index = _build_shuffle_index(
+                    num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
+                )
+            else:
+                shuffle_index = _build_shuffle_index(
+                    sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
+                )
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
@@ -541,7 +508,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the document index from {os.path.basename(path_to_document_index)}",
         )
         t_beg = time.time()
-        document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode='r')
+        document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -551,7 +518,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}",
         )
         t_beg = time.time()
-        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode='r')
+        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -561,7 +528,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}",
         )
         t_beg = time.time()
-        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode='r')
+        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -622,6 +589,7 @@ def _build_document_index(
     Returns:
         numpy.ndarray: The document index
     """
+
     if not separate_final_epoch or num_epochs == 1:
         document_index = numpy.mgrid[0:num_epochs, 0 : len(documents)][1]
         document_index[:] = documents
@@ -651,6 +619,7 @@ def _build_shuffle_index(
     Returns:
         numpy.ndarray: The shuffle index
     """
+
     dtype_ = numpy.uint32
     if total_size >= (numpy.iinfo(numpy.uint32).max - 1):
         dtype_ = numpy.int64
@@ -827,7 +796,14 @@ class MockGPTDataset(GPTDataset):
     ) -> None:
         assert config.mock
 
-        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+        super().__init__(
+            dataset,  # type: ignore[arg-type]
+            dataset_path,
+            indices,
+            num_samples,
+            index_split,
+            config,
+        )
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: MockGPTLowLevelDataset) -> int:
@@ -842,7 +818,7 @@ class MockGPTDataset(GPTDataset):
         return len(low_level_dataset)
 
     @staticmethod
-    def build_low_level_dataset(
+    def build_low_level_dataset(  # type: ignore[override]
         dataset_path: Optional[str], config: GPTDatasetConfig
     ) -> MockGPTLowLevelDataset:
         """Abstract method implementation

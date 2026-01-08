@@ -1,4 +1,3 @@
-# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Helpers for defining sharding for optimizer states based on existing sharding
@@ -128,7 +127,7 @@ def optim_state_to_sharding_state(
     for param_id, param_state in optim_state_dict['state'].items():
         sharded_state[param_id] = {}
         for state_key, param in param_state.items():
-            if state_key in exclude_keys or not isinstance(param, torch.Tensor):
+            if state_key in exclude_keys:
                 continue
             if param_id in id_to_sharded_param_map:
                 sharded_state[param_id][state_key] = make_sharded_optimizer_tensor(

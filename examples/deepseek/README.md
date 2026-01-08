@@ -1,7 +1,7 @@
 # DeepSeek V3 for PyTorch
 
 This directory provides examples of the DeepSeek V3 Mixture-of-Experts (MoE) model training in the Megatron-LM repository on Intel® Gaudi® AI accelerators.
-Before you get started, make sure to review the [Supported Configurations](../../README.md#supported-configurations).
+Before you get started, make sure to review the [Supported Configuration](../../README.md#supported-configuration).
 
 ## Table of Contents
 * [Setup](#setup)

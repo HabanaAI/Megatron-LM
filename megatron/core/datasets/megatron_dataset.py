@@ -27,9 +27,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
 
         indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The minimum number of samples to build from
-        the indexed dataset. When None, build as many samples
-        as correspond to one epoch.
+        num_samples (Optional[int]): The minimum number of samples to build from the indexed
+            dataset. When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indices Split
 
@@ -64,7 +63,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         self.unique_description = json.dumps(
             self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
         )
-        self.unique_description_hash = hashlib.md5(
+        self.unique_description_hash = hashlib.sha256(
             self.unique_description.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
 

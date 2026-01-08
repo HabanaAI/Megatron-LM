@@ -5,9 +5,13 @@ import warnings
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
+import torch
 import torch.nn.functional as F
 
+from megatron.core.enums import Fp8Recipe
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
@@ -15,8 +19,16 @@ from ..utils import (
     init_method_normal,
     is_real_cuda_device_available,
     is_te_min_version,
+    is_torch_min_version,
     scaled_init_method_normal,
 )
+
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
 
 
 @dataclass
@@ -30,16 +42,49 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # model architecture
     ####################
+
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 
+    mtp_num_layers: Optional[int] = None
+    """Number of Multi-Token Prediction (MTP) Layers."""
+
+    mtp_loss_scaling_factor: Optional[float] = None
+    """Weighting factor of Multi-Token Prediction (MTP) loss."""
+
     num_layers_in_first_pipeline_stage: Optional[int] = None
-    """Number of transformer layers on first pipeline stage. 
+    """Number of transformer layers on first pipeline stage.
     None implies equal layer division across PP ranks."""
 
     num_layers_in_last_pipeline_stage: Optional[int] = None
-    """Number of transformer layers on last pipeline stage. 
+    """Number of transformer layers on last pipeline stage.
     None implies equal layer division across PP ranks."""
+
+    pipeline_model_parallel_layout: Optional[Union[str, list, PipelineParallelLayerLayout]] = None
+    """Custom definition of the pipeline parallel partitioning.
+    Support type:
+    - str: e.g., 'Et*3|(tt|)*29,m|L'. Stages are split by '|', replicated stages or layers
+    can be described with multiplication. Commas can be used cosmetically.
+    - list: e.g., [['embedding', 'decoder'], ['decoder', 'decoder', 'decoder', 'loss']].
+    - PipelineParallelLayerLayout: a PipelineParallelLayerLayout object.
+    If given either a string or a list, it will be transferred into a PipelineParallelLayerLayout
+    in post init. Let i = a * pp_size + b, then layout[i] gives a list of the layers 
+    in the a-th vpp stage and the b-th pp stage, i.e., vpp(0)pp(0), vpp(0)pp(1), ..., 
+    vpp(i)pp(j), vpp(i)pp(j+1), ..., vpp(-1)pp(-2), vpp(-1)pp(-1).
+    In the inner lists of layers, 'embedding' or 'E' denotes the embedding layer, 'loss' or 'L'
+    denotes the loss function, and 'decoder' or 't' denotes the transformer decoder layer.
+    Examples:
+        [['embedding', 'decoder'], ['decoder', 'decoder', 'decoder', 'loss']]:
+        pp = 2, vpp = None
+        pp rank 0 holds: embedding, decoder
+        pp rank 1 holds: decoder*3, loss
+        'E|(tt|)*2,(t|)*4,mL':
+        pp = 2, vpp = 4
+        vpp rank 0 pp rank 0 holds: embedding
+        vpp rank 0 pp rank 1~2 holds: decoder*2
+        vpp rank 0 pp rank 3 holds: decoder
+        vpp rank 1 pp rank 0~2 holds: decoder
+        vpp rank 1 pp rank 3 holds: mtp, loss"""
 
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
@@ -58,7 +103,7 @@ class TransformerConfig(ModelParallelConfig):
     attention_backend: AttnBackend = AttnBackend.auto
     """Attention backend to run. By default we let transformer engine
     decide the best backend to run (except in the case of local).
-    If attention backend is local we use the local pytorch implementation in mcore. 
+    If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
 
     softmax_scale: Optional[float] = None
@@ -129,7 +174,7 @@ class TransformerConfig(ModelParallelConfig):
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
     qk_layernorm: bool = False
-    """Whether to apply LayerNorm to the query and key embeddings."""
+    """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -144,6 +189,16 @@ class TransformerConfig(ModelParallelConfig):
 
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
+
+    no_rope_freq: Optional[Union[int, List[int]]] = None
+    """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
+    An integer N: Creates a pattern where RoPE is skipped every N-1 layers. For example,
+    no_rope=4 means RoPE is applied for 3 layers, then skipped for 1 layer, repeating this pattern.
+    A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
+    For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
+
+    moe_deepep_num_sms: int = 20
+    """Number of SMs to use for DeepEP."""
 
     ####################
     # initialization
@@ -163,6 +218,12 @@ class TransformerConfig(ModelParallelConfig):
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
 
+    init_model_with_meta_device: bool = False
+    """
+    If True, initializes the model with the meta device. This is helpful for
+    training of very large models. This feature is only works when custom fsdp is turned on.
+    """
+
     ####################
     # mixed-precision
     ####################
@@ -173,6 +234,10 @@ class TransformerConfig(ModelParallelConfig):
     attention_softmax_in_fp32: bool = True
     """If True, run attention masking and softmax in fp32. This should be True if
     apply_query_key_layer_scaling is True."""
+
+    disable_bf16_reduced_precision_matmul: bool = False
+    """If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to
+    prevent matmul from using reduced precision accumulation when using BF16."""
 
     ####################
     # fusion
@@ -214,7 +279,8 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     recompute_granularity: Optional[str] = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
-    activation checkpointing where only the memory intensive part of attention is checkpointed.
+    activation checkpointing where the submodules set in --recompute-modules is checkpointed.
+    The default is "core_attn" which is the memory intensive part of attention.
     These memory intensive activations are also less compute intensive which makes activation
     checkpointing more efficient for LLMs (20B+).  See Reducing Activation Recomputation in Large
     Transformer Models (https://arxiv.org/abs/2205.05198) for more details.  'full' will checkpoint
@@ -239,6 +305,20 @@ class TransformerConfig(ModelParallelConfig):
     distribute_saved_activations: Optional[bool] = None
     """If True, distribute recomputed activations across the model parallel group."""
 
+    recompute_modules: Optional[List[str]] = None
+    """The submodules to recompute.
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe".
+    default: ["core_attn"].
+    "core_attn": recompute the core attention part of the transformer layer.
+    "moe_act": recompute the MoE MLP activation function.
+    "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
+    "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
+    "mlp": recompute the dense MLP submodule.
+    "moe": recompute the MoE layer.
+    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "core_attn", "mlp", and "moe" uses normal checkpointing.
+    """
+
     ####################
     # fp8 related
     ####################
@@ -246,6 +326,19 @@ class TransformerConfig(ModelParallelConfig):
     """If set, enables the use of FP8 precision through Transformer Engine. There are 2 predefined
     choices (1) 'e4m3' uniformly uses e4m3 for all FP8 tensors, (2) 'hybrid' uses e4m3 for all FP8
     activation and weight tensors and e5m2 for all FP8 output activation gradient tensors."""
+
+    fp8_recipe: Optional[str] = "delayed"
+    """If set, enables the use of FP8 precision through Transformer Engine. There are 3 predefined
+    choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
+    uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only,
+    4) 'blockwise' for blockwise scaling recipe."""
+
+    fp8_param: bool = False
+    """If set, keep the parameters in fp8 precision to save memory. This option must be used
+    together with fp8 mode (i.e., TransformerConfig.fp8 is not None). Note that not all parameters
+    will be converted to fp8; for example, biases will remain unchanged. The parameters affected are
+    primarily the weights of GEMMs. The specific parameters that will be converted to fp8 are
+    determined by TE."""
 
     fp8_margin: int = 0
     """Margin for the scaling factor computation."""
@@ -280,6 +373,20 @@ class TransformerConfig(ModelParallelConfig):
 
     tp_only_amax_red: bool = False
     """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
+	
+    first_last_layers_bf16: bool = False
+    """If True, retains first and last N TransformerBlocks in BF16 as opposed to FP8."""
+
+    num_layers_at_start_in_bf16: int = 1
+    """Number of layers at the start of the model to keep in BF16 precision when
+    first_last_layers_bf16 is True."""
+
+    num_layers_at_end_in_bf16: int = 1
+    """Number of layers at the end of the model to keep in BF16 precision when
+    first_last_layers_bf16 is True."""
+
+    use_kitchen: bool = False
+    """Use the kitchen extension for transformer quantization."""
 
     cache_fp8_weight_fwd: bool = True
     """When set to True, In forward, calculate fp8 weight only once for the entire batch"""
@@ -305,10 +412,6 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_fused_weights: bool = False
     """Use fused Dynamic MoE weights to match OptimumHabana/vLLM format."""
-
-    ####################
-    # MoE related
-    ####################
     moe_shared_expert_intermediate_size: Optional[int] = None
     """Shared expert total ffn hidden size.
     It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
@@ -338,16 +441,21 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to route to for each token."""
 
     moe_router_topk_limited_devices: Optional[int] = None
-    """Number of EP ranks to consider for each token in group-limited routing, 
+    """Number of EP ranks to consider for each token in group-limited routing,
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
     """
+
+    moe_router_padding_for_fp8: Optional[bool] = False
+    """Whether to pad the routing_map to make sure the number of tokens each expert received
+    is a multiple of 16/32 for FP8 precision. This can remove the explicit padding in the
+    GroupedMLP layer."""
 
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
     1. Experts are divided into 'moe_router_num_groups' equal-sized groups
     2. For each token, 'moe_router_group_topk' groups are selected based on sum of
-    top-('moe_router_num_groups'/'moe_router_group_topk') routing scores within each group
+    top-('moe_router_topk'/'moe_router_group_topk') routing scores within each group
     3. From these selected groups, 'moe_router_topk' individual experts are chosen
     Two common use cases:
     - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
@@ -362,18 +470,24 @@ class TransformerConfig(ModelParallelConfig):
     """Number of selected groups for group-limited routing."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
+    """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the 
+    top-k selection.
     By default, softmax is done after top-k."""
 
     moe_router_fp32: bool = False
     """Explicit float32 data type conversion for router input tensor for higher precision."""
 
     moe_router_topk_scaling_factor: Optional[float] = None
-    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax 
+    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
     moe_router_score_function: str = "softmax"
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+
+    moe_router_dtype: Optional[str] = None
+    """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
+    improve stability especially when the number of experts is large (e.g. finegrained-moe).
+    None means no changes for dtype."""
 
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
@@ -381,10 +495,14 @@ class TransformerConfig(ModelParallelConfig):
     See https://arxiv.org/abs/2408.15664 for details."""
 
     moe_router_bias_update_rate: float = 1e-3
-    """The expert bias is updated based on the number of assigned tokens to each expert 
+    """The expert bias is updated based on the number of assigned tokens to each expert
     in a global batch, where the bias is increased for the experts with less assigned tokens
-    and decreased for the experts with more assigned tokens. 
+    and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
+
+    moe_router_force_load_balancing: bool = False
+    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
+    and group-limited topk. This is an experimental feature and only for benchmark."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -412,7 +530,10 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_token_dispatcher_type: str = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
-    Options are 'allgather' and 'alltoall'."""
+    Options are 'allgather','alltoall' and 'flex'."""
+
+    moe_enable_deepep: bool = False
+    """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
@@ -455,7 +576,7 @@ class TransformerConfig(ModelParallelConfig):
     the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
     default setting is False."""
 
-    moe_token_drop_policy: str = 'probs'
+    moe_token_drop_policy: str = "probs"
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
     the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
     be dropped.
@@ -466,6 +587,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
+
+    moe_apply_probs_on_input: bool = False
+    """Apply probs on input of experts instead of applying after activation and glu."""
 
     ##################
     # Context Parallel
@@ -481,7 +605,7 @@ class TransformerConfig(ModelParallelConfig):
     async, and cannot be overlapped.
     "a2a": Like DeepSpeed Ulysses, scatter attention heads across the CP group, and gather to get
     full sequence of QKV.
-    "a2a+p2p": A hierarchical implementation of context parallelism to attention. 
+    "a2a+p2p": A hierarchical implementation of context parallelism to attention.
     It uses A2A communications in low-level CP groups (e.g., via NVLink),
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
@@ -493,10 +617,10 @@ class TransformerConfig(ModelParallelConfig):
     """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
 
     cuda_graph_use_single_mempool: bool = False
-    """When set to true, cudagraphs will be captured inside a single mempool, in which all 
-    cudagraphs may only be used once per step. If false, cudagraphs may be reused across 
-    microbatches. Enabling may reduce cudagraph memory overheads due to memory fragmentation, 
-    however may greatly increase the number of cudagraphs created when the number of microbatches 
+    """When set to true, cudagraphs will be captured inside a single mempool, in which all
+    cudagraphs may only be used once per step. If false, cudagraphs may be reused across
+    microbatches. Enabling may reduce cudagraph memory overheads due to memory fragmentation,
+    however may greatly increase the number of cudagraphs created when the number of microbatches
     is high."""
 
     cuda_graph_retain_backward_graph: bool = False
@@ -509,6 +633,11 @@ class TransformerConfig(ModelParallelConfig):
 
     external_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+
+    cuda_graph_scope: str = "full"
+    """When external_cuda_graph is set to true, cuda_graph_scope determines the CUDA graphs
+    capturing scope. Valid values are "full" and "attn". "Full" scope captures a whole Transformer
+    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention()."""
 
     ####################
     # miscellaneous
@@ -539,17 +668,62 @@ class TransformerConfig(ModelParallelConfig):
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
+    symmetric_ar_type: Optional[str] = None
+    """Type of symmetric all reduce to use"""
+
+    mrope_section: Optional[List[int]] = None
+    """ Multimodal rope section is for channel dimension of temporal, height and width
+    in rope calculation. """
+
+    is_hybrid_model: bool = False
+    """ Indicates whether this is a hybrid model. """
+
+    mamba_state_dim: int = 128
+    """The dimensionality of the state representation in Mamba layers."""
+
+    mamba_head_dim: int = 64
+    """The dimensionality of the heads in the Mamba layers."""
+
+    mamba_num_groups: int = 8
+    """The number of groups used in Mamba layers."""
+
+    mamba_num_heads: Optional[int] = None
+    """The number of heads used in Mamba layers. 
+    If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
+
+    use_mamba_mem_eff_path: bool = True
+    """If True, use the memory efficient path for Mamba layers."""
+
+    mlp_chunks_for_prefill: int = 1
+    """The number of chunks along the sequence dimension to use for MLP computation
+    during prefill."""
+
+    heterogeneous_block_specs: bool = False
+    """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
+
+    hetereogenous_dist_checkpoint: bool = False
+    """Whether to use heterogenous layers in distributed checkpoint."""
+
+    ####################
+    # Quantization
+    ####################
+    quant_recipe: Optional[RecipeConfig] = None
+    """Configuration of any quantization to be applied to the model"""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
-
         if self.fp16 and self.bf16:
             raise ValueError(
-                f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.'
+                f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
             )
+
+        # Apply BF16 matmul precision setting if needed
+        if self.bf16 and self.disable_bf16_reduced_precision_matmul:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
         if self.num_attention_heads % self.tensor_model_parallel_size != 0:
             raise ValueError(
@@ -572,30 +746,80 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        if self.fp8:
+            # cannot support first last layer bf16 with delayed scaling
+            if self.first_last_layers_bf16 and self.fp8_recipe == Fp8Recipe.delayed:
+                raise ValueError("Delayed scaling does not support first / last layer in BF16.")
+
+            # max bf16 layers per pipeline stage
+            max_bf16_layers_per_pipeline_stage = (
+                self.num_layers // self.pipeline_model_parallel_size
+            )
+
+            # check start/end bf16 layer counts are valid
+            if self.first_last_layers_bf16:
+                if (
+                    self.num_layers_at_start_in_bf16 < 0
+                    or self.num_layers_at_start_in_bf16 > max_bf16_layers_per_pipeline_stage
+                ):
+                    raise ValueError(
+                        f"num_layers_at_start_in_bf16 ({self.num_layers_at_start_in_bf16}) must be "
+                        f"between 0 and number of layers per pipeline stage "
+                        f"({max_bf16_layers_per_pipeline_stage})."
+                    )
+                if (
+                    self.num_layers_at_end_in_bf16 < 0
+                    or self.num_layers_at_end_in_bf16 > max_bf16_layers_per_pipeline_stage
+                ):
+                    raise ValueError(
+                        f"num_layers_at_end_in_bf16 ({self.num_layers_at_end_in_bf16}) must be "
+                        f"between 0 and number of layers per pipeline stage "
+                        f"({max_bf16_layers_per_pipeline_stage})."
+                    )
+
+        if self.fp8_param and not self.fp8:
+            raise ValueError("fp8_param must be used together with fp8 mode.")
+
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
-            raise ValueError('num_moe_experts must be non None to use expert-parallel.')
+            raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
-            raise ValueError('num_moe_experts must be non-negative.')
+            raise ValueError("num_moe_experts must be non-negative.")
 
-        if self.moe_ffn_hidden_size is None:
+        if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
+            warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
+
+        if self.num_moe_experts is None:
+            assert (
+                self.moe_ffn_hidden_size is None
+            ), "moe_ffn_hidden_size must be None when num_experts is not set."
+
+        if self.moe_enable_deepep:
+            if self.moe_token_dispatcher_type != "flex":
+                raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
+
+        if self.moe_token_dispatcher_type == "flex":
+            if self.moe_pad_expert_input_to_capacity:
+                raise ValueError(
+                    "Flex token dispatcher does not support moe_pad_expert_input_to_capacity"
+                )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
-                    f'moe_shared_expert_intermediate_size must be '
-                    f'num_shared_experts * ffn_size_of_each_shared_expert, '
-                    f'but got {self.moe_shared_expert_intermediate_size}'
+                    f"moe_shared_expert_intermediate_size must be "
+                    f"num_shared_experts * ffn_size_of_each_shared_expert, "
+                    f"but got {self.moe_shared_expert_intermediate_size}"
                 )
             if self.moe_shared_expert_overlap and self.moe_token_dispatcher_type not in [
                 "alltoall"
             ]:
                 raise ValueError(
-                    f'moe_shared_expert_overlap only works with alltoall token dispatcher.'
+                    f"moe_shared_expert_overlap only works with alltoall token dispatcher."
                 )
 
         if self.moe_expert_capacity_factor is not None:
@@ -607,64 +831,118 @@ class TransformerConfig(ModelParallelConfig):
                 self.moe_expert_capacity_factor = None
             if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
                 raise ValueError(
-                    'moe_expert_capacity_factor only works with aux_loss or none load balancing'
+                    "moe_expert_capacity_factor only works with aux_loss or none load balancing"
+                )
+
+        if self.moe_pad_expert_input_to_capacity:
+            if self.moe_expert_capacity_factor is None and self.moe_capacity_bins_num == 0:
+                raise ValueError(
+                    "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
                 )
 
         if self.cpu_offloading and (
             self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
         ):
             raise ValueError(
-                f'CPU offloading can be done only for layers less than {self.num_layers}'
+                f"CPU offloading can be done only for layers less than {self.num_layers}"
             )
 
         if self.cpu_offloading and self.pipeline_model_parallel_size > 1:
             raise ValueError(
-                'Currently there is no support for Pipeline parallelism with CPU offloading'
+                "Currently there is no support for Pipeline parallelism with CPU offloading"
             )
 
         if self.cpu_offloading and self.recompute_granularity is not None:
             raise ValueError(
-                'CPU offloading does not work when activation recomputation is enabled'
+                "CPU offloading does not work when activation recomputation is enabled"
             )
 
         if self.recompute_granularity is not None:
-            if self.recompute_granularity not in ['full', 'selective']:
+            if self.recompute_granularity not in ["full", "selective"]:
                 raise ValueError(
                     f'When using recompute_granuarlity: {self.recompute_granularity} must be "full"'
                     'or "selective".'
                 )
 
             if self.recompute_method is not None:
-                if self.recompute_method not in ['block', 'uniform']:
+                if self.recompute_method not in ["block", "uniform"]:
                     raise ValueError(
                         f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
                     )
-            elif self.recompute_granularity != 'selective':
+            elif self.recompute_granularity != "selective":
                 raise ValueError(
-                    f'Using recompute_granularity: {self.recompute_granularity} so '
+                    f"Using recompute_granularity: {self.recompute_granularity} so "
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_granularity != 'selective' and self.recompute_num_layers is None:
+            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} '
-                    'recompute_num_layers must be between '
-                    '1 and num_layers_per_pipeline_rank: '
-                    f'{self.num_layers // self.pipeline_model_parallel_size}'
+                    f"When using recompute_granularity: {self.recompute_granularity} "
+                    "recompute_num_layers must be between "
+                    "1 and num_layers_per_pipeline_rank: "
+                    f"{self.num_layers // self.pipeline_model_parallel_size}"
                 )
             elif (
-                self.recompute_granularity == 'selective' and self.recompute_num_layers is not None
+                self.recompute_granularity == "selective" and self.recompute_num_layers is not None
             ):
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} '
-                    'recompute_num_layers must be None.'
+                    f"When using recompute_granularity: {self.recompute_granularity} "
+                    "recompute_num_layers must be None."
                 )
 
             if self.distribute_saved_activations and self.sequence_parallel:
                 raise ValueError(
-                    f'distribute_saved_activations: {self.distribute_saved_activations} must be '
-                    f'false when sequence parallel is enabled: {self.sequence_parallel}'
+                    f"distribute_saved_activations: {self.distribute_saved_activations} must be "
+                    f"false when sequence parallel is enabled: {self.sequence_parallel}"
                 )
+
+        if self.recompute_modules is None:
+            self.recompute_modules = ["core_attn"]
+
+        if self.recompute_granularity == "selective":
+            if len(self.recompute_modules) > 0:
+                allowed_modules = {"core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe"}
+                invalid_modules = set(self.recompute_modules) - allowed_modules
+                assert not invalid_modules, (
+                    f"Invalid choices for recompute_modules: {invalid_modules}. "
+                    f"Allowed modules are: {allowed_modules}"
+                )
+
+            if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:
+                raise ValueError(
+                    "moe_act in recompute_modules is only supported with moe_grouped_gemm."
+                )
+
+            if "mla_up_proj" in self.recompute_modules and not self.multi_latent_attention:
+                raise ValueError(
+                    "mla_up_proj in recompute_modules is only supported with "
+                    "multi_latent_attention."
+                )
+
+            if "core_attn" in self.recompute_modules:
+                warnings.warn(
+                    "If you are using transformer_engine as the transformer implementation, "
+                    "the core_attn is from transformer_engine and may be the fused version. "
+                    "For fused attention, you have no need to set 'core_attn' to recompute. "
+                    "Please check that the core_attn recompute is really needed."
+                )
+
+            if self.fp8:
+                if "moe_act" in self.recompute_modules or "layernorm" in self.recompute_modules:
+                    raise ValueError("moe_act and layernorm recompute cannot work with fp8.")
+
+        if self.moe_layer_recompute:
+            warnings.warn(
+                "--moe-layer-recompute is deprecated. "
+                "Use --recompute-granularity selective --recompute-modules moe_layer instead."
+            )
+            if self.recompute_granularity == "full":
+                raise ValueError(
+                    "Do not set --moe-layer-recompute with full recompute granularity. "
+                )
+            self.recompute_granularity = "selective"
+            if "moe" not in self.recompute_modules:
+                self.recompute_modules.append("moe")
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -673,12 +951,64 @@ class TransformerConfig(ModelParallelConfig):
             self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
         ):
             raise ValueError(
-                'num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage cannot be'
-                'set at the same time with account_for_embedding_in_pipeline_split'
-                'and account_for_loss_in_pipeline_split'
+                "num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage cannot be"
+                "set at the same time with account_for_embedding_in_pipeline_split"
+                "and account_for_loss_in_pipeline_split"
             )
 
-        if (
+        # PP layout
+        if self.pipeline_model_parallel_layout is not None:
+            # If pipeline layout is set, we will check the conflicts
+            # with other pipeline layout arguments.
+            any_conflict = (
+                self.num_layers_in_first_pipeline_stage is not None
+                or self.num_layers_in_last_pipeline_stage is not None
+                or self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            )
+            if any_conflict:
+                raise ValueError(
+                    "pipeline_model_parallel_layout cannot be set"
+                    " with other pipeline layout arguments."
+                    f" {self.num_layers_in_first_pipeline_stage=},"
+                    f" {self.num_layers_in_last_pipeline_stage=},"
+                    f" {self.account_for_embedding_in_pipeline_split=},"
+                    f" {self.account_for_loss_in_pipeline_split=}."
+                )
+
+            # Transfer pipeline_model_parallel_layout from str or list to
+            # PipelineParallelLayerLayout
+            if isinstance(self.pipeline_model_parallel_layout, str):
+                self.pipeline_model_parallel_layout = PipelineParallelLayerLayout.from_str(
+                    layout=self.pipeline_model_parallel_layout,
+                    pipeline_model_parallel_size=self.pipeline_model_parallel_size,
+                )
+            elif isinstance(self.pipeline_model_parallel_layout, list):
+                # Since list is not hashable, the initialization will not be cached.
+                self.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
+                    layout=self.pipeline_model_parallel_layout,
+                    pipeline_model_parallel_size=self.pipeline_model_parallel_size,
+                )
+
+            # Check whether the input VPP size conflicts with the PP layout
+            detected_vpp_size = (
+                self.pipeline_model_parallel_layout.virtual_pipeline_model_parallel_size
+            )
+            if self.virtual_pipeline_model_parallel_size is not None:
+                assert self.virtual_pipeline_model_parallel_size == detected_vpp_size, (
+                    f"virtual_pipeline_model_parallel_size conflicts with"
+                    f" pipeline_model_parallel_layout,"
+                    f" ({self.virtual_pipeline_model_parallel_size=}, "
+                    f" {detected_vpp_size=})"
+                )
+            elif detected_vpp_size > 1:
+                self.virtual_pipeline_model_parallel_size = detected_vpp_size
+
+            # Check whether the layout is valid.
+            self.pipeline_model_parallel_layout.validate_layer_layout(num_layers=self.num_layers)
+
+        # Uneven PP
+        elif (
             self.num_layers_in_first_pipeline_stage is not None
             or self.num_layers_in_last_pipeline_stage is not None
         ):
@@ -687,7 +1017,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.num_layers_in_first_pipeline_stage is not None:
                 if self.num_layers_in_first_pipeline_stage <= 0:
-                    raise ValueError('num_layers_in_first_pipeline_stage must be larger than 0')
+                    raise ValueError("num_layers_in_first_pipeline_stage must be larger than 0")
 
                 if self.virtual_pipeline_model_parallel_size is not None:
                     if (
@@ -696,17 +1026,17 @@ class TransformerConfig(ModelParallelConfig):
                         != 0
                     ):
                         raise ValueError(
-                            f'number of layers at first stage: '
-                            f'{self.num_layers_in_first_pipeline_stage}'
-                            f'must be divisible by virtual pipeline'
-                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
+                            f"number of layers at first stage: "
+                            f"{self.num_layers_in_first_pipeline_stage}"
+                            f"must be divisible by virtual pipeline"
+                            f"parallel degree {self.virtual_pipeline_model_parallel_size}"
                         )
                 num_layers -= self.num_layers_in_first_pipeline_stage
                 pipeline_parallel_size -= 1
 
             if self.num_layers_in_last_pipeline_stage is not None:
                 if self.num_layers_in_last_pipeline_stage <= 0:
-                    raise ValueError('num_layers_in_last_pipeline_stage must be larger than 0')
+                    raise ValueError("num_layers_in_last_pipeline_stage must be larger than 0")
 
                 if self.virtual_pipeline_model_parallel_size is not None:
                     if (
@@ -715,21 +1045,25 @@ class TransformerConfig(ModelParallelConfig):
                         != 0
                     ):
                         raise ValueError(
-                            f'number of layers at last stage: '
-                            f'{self.num_layers_in_last_pipeline_stage}'
-                            f'must be divisible by virtual pipeline'
-                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
+                            f"number of layers at last stage: "
+                            f"{self.num_layers_in_last_pipeline_stage}"
+                            f"must be divisible by virtual pipeline"
+                            f"parallel degree {self.virtual_pipeline_model_parallel_size}"
                         )
                 num_layers -= self.num_layers_in_last_pipeline_stage
                 pipeline_parallel_size -= 1
 
-            if not num_layers % pipeline_parallel_size == 0:
+            # Here pipeline_parallel_size is the number of middle PP stages. If there are middle
+            # PP stages, check number of layers at middle stage is divisible by middle PP size.
+            if pipeline_parallel_size and not num_layers % pipeline_parallel_size == 0:
                 raise ValueError(
-                    f'number of layers at middle stage: {num_layers} must be divisible by'
-                    f'the middle pipeline model parallel size {pipeline_parallel_size}'
+                    f"number of layers at middle stage: {num_layers} must be divisible by"
+                    f"the middle pipeline model parallel size {pipeline_parallel_size}"
                 )
 
-            if self.virtual_pipeline_model_parallel_size is not None:
+            # If there are middle PP stages, check number of layers
+            # on each middle PP rank is divisible by VPP size.
+            if pipeline_parallel_size and self.virtual_pipeline_model_parallel_size is not None:
                 num_layers_per_middle_pipeline_rank = num_layers // pipeline_parallel_size
                 if (
                     not num_layers_per_middle_pipeline_rank
@@ -737,25 +1071,27 @@ class TransformerConfig(ModelParallelConfig):
                     == 0
                 ):
                     raise ValueError(
-                        f'number of layers on each middle pipeline rank:'
-                        f'{num_layers_per_middle_pipeline_rank} must be divisible by virtual'
-                        f'pipeline parallel degree {self.virtual_pipeline_model_parallel_size}'
+                        f"number of layers on each middle pipeline rank:"
+                        f"{num_layers_per_middle_pipeline_rank} must be divisible by virtual"
+                        f"pipeline parallel degree {self.virtual_pipeline_model_parallel_size}"
                     )
 
-        if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
+        elif (
+            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
+        ):
             if self.virtual_pipeline_model_parallel_size is None:
-                pipeline_parallel_size = self.pipeline_model_parallel_size
+                num_layers = self.num_layers
 
                 if self.account_for_embedding_in_pipeline_split:
-                    pipeline_parallel_size -= 1
+                    num_layers += 1
 
                 if self.account_for_loss_in_pipeline_split:
-                    pipeline_parallel_size -= 1
+                    num_layers += 1
 
-                if not self.num_layers % pipeline_parallel_size == 0:
+                if not num_layers % self.pipeline_model_parallel_size == 0:
                     raise ValueError(
-                        f'number of middle layers: {self.num_layers} must be divisible by '
-                        f'middle pipeline_model_parallel_size {pipeline_parallel_size}'
+                        f"number of middle layers: {num_layers} must be divisible by "
+                        f"middle pipeline_model_parallel_size {self.pipeline_model_parallel_size}"
                     )
             else:
                 num_layers = self.num_layers
@@ -767,11 +1103,11 @@ class TransformerConfig(ModelParallelConfig):
 
                 if not num_layers % self.pipeline_model_parallel_size == 0:
                     raise ValueError(
-                        f'num_layers: {num_layers} after enable'
-                        f'account_for_embedding_in_pipeline_split or '
-                        f'account_for_loss_in_pipeline_split must be divisible'
-                        f'by pipeline_model_parallel_size '
-                        f'{self.pipeline_model_parallel_size}'
+                        f"num_layers: {num_layers} after enable"
+                        f"account_for_embedding_in_pipeline_split or "
+                        f"account_for_loss_in_pipeline_split must be divisible"
+                        f"by pipeline_model_parallel_size "
+                        f"{self.pipeline_model_parallel_size}"
                     )
 
                 num_layers_per_pipeline_rank = num_layers // self.pipeline_model_parallel_size
@@ -780,11 +1116,11 @@ class TransformerConfig(ModelParallelConfig):
                     == 0
                 ):
                     raise ValueError(
-                        f'number of layers on each pipeline rank: {num_layers_per_pipeline_rank}'
-                        f'(after enable account_for_embedding_in_pipeline_split or '
-                        f'account_for_loss_in_pipeline_split) must be divisible by'
-                        f'virtual_pipeline_model_parallel_size'
-                        f'{self.virtual_pipeline_model_parallel_size}'
+                        f"number of layers on each pipeline rank: {num_layers_per_pipeline_rank}"
+                        f"(after enable account_for_embedding_in_pipeline_split or "
+                        f"account_for_loss_in_pipeline_split) must be divisible by"
+                        f"virtual_pipeline_model_parallel_size"
+                        f"{self.virtual_pipeline_model_parallel_size}"
                     )
 
         if self.apply_query_key_layer_scaling:
@@ -812,25 +1148,28 @@ class TransformerConfig(ModelParallelConfig):
 
         cuda_available = is_real_cuda_device_available()
         if self.apply_rope_fusion:
-            if self.rotary_interleaved:
-                raise ValueError("rotary_interleaved does not work with apply_rope_fusion.")
+            if self.multi_latent_attention:
+                warnings.warn(
+                    "apply_rope_fusion for multi-latent attention only supports training. "
+                    "It is experimental and may change in future versions."
+                )
+            else:
+                if self.rotary_interleaved:
+                    if not is_te_min_version("2.3.0.dev0"):
+                        raise ValueError(
+                            "rotary_interleaved does not work with apply_rope_fusion for "
+                            "TE < 2.3.0.dev0. Please install TE >= 2.3.0.dev0"
+                        )
 
-            from megatron.core.models.common.embeddings.rope_utils import (
-                fused_apply_rotary_pos_emb,
-                fused_apply_rotary_pos_emb_thd,
-            )
-
-            if (
-                cuda_available
-                and fused_apply_rotary_pos_emb is None
-                and fused_apply_rotary_pos_emb_thd is None
-            ):
-                raise ValueError(
-                    "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
+                from megatron.core.models.common.embeddings.rope_utils import (
+                    fused_apply_rotary_pos_emb,
+                    fused_apply_rotary_pos_emb_thd,
                 )
 
-            if self.multi_latent_attention:
-                raise ValueError("multi_latent_attention does not support apply_rope_fusion.")
+                if cuda_available and fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
+                    raise ValueError(
+                        "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
+                    )
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
@@ -840,8 +1179,13 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.output_layer_init_method is None:
             self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std, self.num_layers
+                self.init_method_std,
+                self.num_layers,
+                multiplier=2.0 if not self.is_hybrid_model else 1.0,
             )
+
+        if self.num_moe_experts is not None:
+            assert not self.add_bias_linear, "Bias is not supported for MoE"
 
         if (
             self.moe_token_dispatcher_type == "alltoall_seq"
@@ -871,11 +1215,21 @@ class TransformerConfig(ModelParallelConfig):
                     f"but your version is {get_te_version()}."
                 )
 
+        if self.moe_router_padding_for_fp8:
+            if self.fp8 is None:
+                raise ValueError("fp8 must be specified when moe_router_padding_for_fp8 is True.")
+
+            if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
+                raise ValueError(
+                    "allgather and alltoall_seq dispatcher does not support "
+                    "moe_router_padding_for_fp8."
+                )
+
         if (
             self.moe_router_topk == 1
-            and self.moe_router_score_function == 'softmax'
+            and self.moe_router_score_function == "softmax"
             and not self.moe_router_pre_softmax
-            and self.moe_router_load_balancing_type != 'sinkhorn'
+            and self.moe_router_load_balancing_type != "sinkhorn"
         ):
             # Requires applying softmax before selecting the top-k when k is 1,
             # since softmax on a [num_tokens, 1] would yield a zero gradient.
@@ -927,18 +1281,22 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (
                 fused_permute,
+                fused_permute_with_probs,
                 fused_sort_chunks_by_index,
+                fused_sort_chunks_by_index_with_probs,
                 fused_unpermute,
             )
 
             if (
                 fused_permute is None
+                or fused_permute_with_probs is None
                 or fused_sort_chunks_by_index is None
+                or fused_sort_chunks_by_index_with_probs is None
                 or fused_unpermute is None
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
 
-        if self.cp_comm_type is not None:
+        if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
                     f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "
@@ -953,6 +1311,42 @@ class TransformerConfig(ModelParallelConfig):
             self.pipeline_model_parallel_size > 0
         ), f"Pipeline model parallel size must be larger than 0 \
             when enable --standalone-embedding-stage and --standalone-loss-stage"
+
+        if (
+            self.num_moe_experts is not None
+            and self.num_moe_experts >= 32
+            and not self.moe_router_dtype
+        ):
+            warnings.warn(
+                "Using a large number of experts (e.g. >=32) without fp32 routing. "
+                "Consider enabling moe_router_dtype for better numerical stability."
+            )
+        if self.symmetric_ar_type is not None:
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
+            assert is_torch_min_version("2.7.0a0"), "Must have at least torch version 2.7 or higher"
+            assert is_te_min_version("2.3.0") or get_te_version() == PkgVersion(
+                "2.3.0.dev0+39c0e70"
+            ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
+
+        if self.no_rope_freq:
+            assert not self.flash_decode, "flash_decode cannot be used with no_rope."
+            if isinstance(self.no_rope_freq, int):
+                assert self.num_layers % self.no_rope_freq == 0, (
+                    f"no_rope_freq={self.no_rope_freq} should be "
+                    f"divisible by num_layers={self.num_layers}."
+                )
+                # Convert integer pattern to list pattern
+                # e.g. no_rope=4 with num_layers=8 becomes [0,0,0,1,0,0,0,1]
+                pattern = [0] * (self.no_rope_freq - 1) + [1]
+                self.no_rope_freq = pattern * (self.num_layers // self.no_rope_freq)
+            else:
+                assert len(self.no_rope_freq) == self.num_layers, (
+                    f"Length of no_rope list ({len(self.no_rope_freq)}) must match "
+                    f"the number of layers ({self.num_layers})"
+                )
 
 
 @dataclass
@@ -1011,17 +1405,7 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.707
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
-
-_APPLY_CAG_DTYPE_CAST_WA = False
-
-
-# pylint: disable=missing-function-docstring
-def set_cag_dtype_cast_wa(state):
-    global _APPLY_CAG_DTYPE_CAST_WA
-    _APPLY_CAG_DTYPE_CAST_WA = state
-
-
-# pylint: disable=missing-function-docstring
-def apply_dtype_cast_wa():
-    global _APPLY_CAG_DTYPE_CAST_WA
-    return _APPLY_CAG_DTYPE_CAST_WA
+    def __post_init__(self):
+        super().__post_init__()
+        if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
+            raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")

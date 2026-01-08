@@ -11,7 +11,7 @@ from tqdm import tqdm
 import types
 
 from megatron.core.utils import is_real_cuda_device_available
-
+from tools.checkpoint.utils import _ConverterFakeProcessGroup
 device = "cpu"
 
 def add_arguments(parser):
@@ -176,6 +176,7 @@ def set_mlp_state(args, layer, hf_layer):
 
     layer.mlp.router.weight.data.copy_(hf_layer.block_sparse_moe.gate.weight)
 
+    mcore_experts = layer.mlp.experts.local_experts
     hf_experts = hf_layer.block_sparse_moe.experts
 
     if not args.moe_dynamic_hpu:
@@ -229,7 +230,7 @@ def load_checkpoint_to_model(args):
     '''Set model params.'''
 
     from pretrain_gpt import model_provider
-    from transformers import MixtralForCausalLM
+    from transformers import MixtralForCausalLM, MixtralConfig
 
     # Load Huggingface model.
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map=device)
@@ -313,7 +314,7 @@ def _load_checkpoint(queue, args):
         assert os.path.exists(capacity_bins_path), 'The file for loading capacity bins parameters is missing.'
         capacity_bins = torch.load(capacity_bins_path, weights_only=False)
 
-    validate_args(margs)
+    margs = validate_args(margs)
 
     def check_for_arg(arg_name, dest_arg_name=None, default=None):
         if getattr(margs, arg_name, None) is None and getattr(margs, dest_arg_name, None):
@@ -353,6 +354,11 @@ def _load_checkpoint(queue, args):
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
     if is_real_cuda_device_available():
+        # For backward compatibility during local parallel states refactoring
+        fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
+        fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
+        mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+        mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
         fused_kernels.load(margs)
 
     # Metadata.
@@ -376,7 +382,7 @@ def _load_checkpoint(queue, args):
     md.previous_pipeline_parallel_size = margs.previous_pipeline_model_parallel_size
     md.previous_expert_tensor_parallel_size = margs.previous_expert_tensor_parallel_size
     md.previous_expert_model_parallel_size = margs.previous_expert_model_parallel_size
-    md.true_vocab_size = margs.vocab_size # skips padding in saver
+    md.true_vocab_size = margs.vocab_size  # skips padding in saver
     md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
     md.checkpoint_args = margs
     md.consumed_train_samples = 0
@@ -439,10 +445,10 @@ def _load_checkpoint(queue, args):
             message["bins usage last"] = capacity_bins["optimize_moe_bins_usage_last"][layer_idx]
             message["total requested capacity last"] = capacity_bins["optimize_moe_total_requested_capacity_last"][layer_idx]
             message["capacity bins"] = capacity_bins['capacity_bins'][layer_idx]
-        
+
         if not margs.moe_dynamic_hpu:
             if is_real_cuda_device_available() and md.swiglu:
-                chunked_mlp_l0_weight =  [torch.chunk(local_expert.linear_fc1.weight.data, 2, dim=0) for local_expert in experts]
+                chunked_mlp_l0_weight = [torch.chunk(local_expert.linear_fc1.weight.data, 2, dim=0) for local_expert in experts]
                 message["mlp l0 weight W"] = torch.stack([local_weight[0] for local_weight in chunked_mlp_l0_weight], dim=0)
                 message["mlp l0 weight V"] = torch.stack([local_weight[1] for local_weight in chunked_mlp_l0_weight], dim=0)
             else:
@@ -467,6 +473,7 @@ def _load_checkpoint(queue, args):
         })
 
     queue.put("done")
+
 
 def load_checkpoint(queue, args):
     try:

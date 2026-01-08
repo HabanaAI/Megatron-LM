@@ -2,6 +2,7 @@
 import functools
 import time
 import typing
+import warnings
 from collections import OrderedDict
 from typing import Dict, Optional, Type, Union
 
@@ -43,10 +44,12 @@ class Scheduler:
         prompt: Optional[str] = None,
         prompt_tokens: Optional[torch.Tensor] = None,
         encoder_prompt: Optional[str] = None,
-        inference_parameters: Optional[SamplingParams] = None,
+        sampling_params: Optional[SamplingParams] = None,
         arrival_time: Optional[float] = None,
         streaming: bool = False,
         inference_request: Optional[InferenceRequest] = None,
+        *,
+        inference_parameters: Optional[SamplingParams] = None,
     ) -> str:
         """Add an incoming request
 
@@ -57,7 +60,7 @@ class Scheduler:
             prompt (str): Input prompt string
             prompt_tokens (torch.Tensor): A torch tensor having the input prompts tokenized
             encoder_prompt (str): Encoder input string
-            inference_parameters (SamplingParams): The inference parameters
+            sampling_params (SamplingParams): The sampling parameters
             arrival_time (float, optional): The incoming request time. Defaults to None.
             streaming (bool, optional): Whether to asynchronously stream tokens for this request.
             inference_request (InferenceRequest, optional): A fully constructed request.
@@ -72,6 +75,15 @@ class Scheduler:
             else Status.WAITING_IN_QUEUE
         )
 
+        # Deprecation warning for `inference_parameters`.
+        if inference_parameters is not None:
+            warnings.warn(
+                "`inference_parameters` has been renamed to `sampling_params`, and the "
+                "previous name will be removed in `megatron-core` 0.13."
+            )
+            if sampling_params is None:
+                sampling_params = inference_parameters
+
         if inference_request is None:
             assert prompt is not None
             assert prompt_tokens is not None
@@ -84,7 +96,7 @@ class Scheduler:
             inference_request = InferenceRequest(
                 request_id=request_id,
                 prompt=prompt,
-                inference_parameters=inference_parameters,
+                sampling_params=sampling_params,
                 arrival_time=arrival_time,
                 prompt_tokens=prompt_tokens,
                 status=status,
@@ -109,13 +121,19 @@ class Scheduler:
 
         return request_id
 
+    def num_requests_pending(self) -> int:
+        """Get the number of requests pending.
+
+        This method returns the number of active + waiting requests.
+        """
+        return len(self.active_request_pool) + len(self.waiting_request_pool)
+
     def have_requests_pending(self) -> bool:
-        """Method to check if there are requests pending
+        """Method to check if there are requests pending.
 
         This method returns False only when there are no active requests or waiting requests.
         """
-        num_requests_pending = len(self.active_request_pool) + len(self.waiting_request_pool)
-        return num_requests_pending > 0
+        return self.num_requests_pending() > 0
 
     def add_earliest_waiting_request_to_active_pool(self):
         """Utility to add the waiting request to active pool
@@ -167,7 +185,7 @@ class Scheduler:
         self,
         request_id: str,
         *,
-        exception: Optional[Union[BaseException, Type[BaseException]]] = None
+        exception: Optional[Union[BaseException, Type[BaseException]]] = None,
     ):
         """Cancels the given request"""
         stream = self.streams.get(request_id, None)
