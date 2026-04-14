@@ -1,3 +1,4 @@
+# © 2025-2026 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Storage writer for PyT Distributed format allowing asynchronous save. """
@@ -5,7 +6,7 @@ import dataclasses
 import inspect
 import logging
 import os
-import pickle
+import pickle  # nosec
 import queue
 from functools import partial
 from heapq import heappop, heappush
@@ -31,6 +32,7 @@ from torch.distributed.checkpoint.planner import SavePlan, SavePlanner, WriteIte
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
+from ...utils import is_real_cuda_device_available
 from .async_utils import _disable_gc
 
 logger = logging.getLogger(__name__)
@@ -195,8 +197,8 @@ class FileSystemWriterAsync(FileSystemWriter):
             return None, None, []
         transform_list = [self.transforms] if hasattr(self, 'transforms') else []
         return (
-            partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
-            partial(self.preload_tensors, self.write_buckets, True),
+            partial(self.write_preloaded_data_multiproc, self, transform_list, self.use_msc),
+            partial(self.preload_tensors, self.write_buckets, False),
             [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
         )
 
@@ -225,6 +227,7 @@ class FileSystemWriterAsync(FileSystemWriter):
     @staticmethod
     @_disable_gc()
     def write_preloaded_data_multiproc(
+        self,
         transform_list: List[_StorageWriterTransforms],
         use_msc: bool,
         rank: int,
@@ -254,6 +257,10 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         logger = logging.getLogger(__name__)
         w_start = time()
+
+        if not is_real_cuda_device_available():
+            write_buckets = self.preload_tensors(write_buckets, non_blocking=False)
+
         write_results_or_exc: Union[dict, Exception] = dict()
         ctx = mp.get_context('fork')
         local_results_queue = ctx.Queue()
@@ -367,7 +374,7 @@ class FileSystemWriterAsync(FileSystemWriter):
 
                 extra_kwargs['serialization_format'] = SerializationFormat.TORCH_SAVE
             if use_msc:
-                import multistorageclient as msc
+                import multistorageclient as msc  # type: ignore[import-not-found]
 
                 open_file = msc.open
             else:
@@ -509,7 +516,7 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         This method is available in PyTorch 2.3 and above.
         """
-        if checkpoint_id.startswith("msc://"):
+        if str(checkpoint_id).startswith("msc://"):
             return True
 
         if hasattr(FileSystemWriter, "validate_checkpoint_id"):
@@ -580,8 +587,8 @@ def _split_by_separation_hint(
     bins = len(buckets)
     buckets_with_separation_hint = {}
     if separation_hint is not None:
-        buckets_default = [[] for _ in range(bins)]
-        buckets_hint = [[] for _ in range(bins)]
+        buckets_default: List[List[WriteItem]] = [[] for _ in range(bins)]
+        buckets_hint: List[List[WriteItem]] = [[] for _ in range(bins)]
         for i in range(bins):
             for item in buckets[i]:
                 if item.index.fqn.startswith(separation_hint):

@@ -1,10 +1,16 @@
-# © 2024-2025 Intel Corporation
+# © 2024-2026 Intel Corporation
 
 import os
-
+import re
 import torch
 
-major, minor, patch = [eval(ss) for ss in torch.__version__.split('+')[0].split('.')]
+version_str = torch.__version__.split('+')[0]  # Remove git hash part
+# Extract numeric parts only from version
+match = re.match(r'.*?(\d+)\.(\d+)\.(\d+)', version_str)
+if match:
+    major, minor, patch = [int(x) for x in match.groups()]
+else:
+    print("Warning: Unable to parse torch version string:", version_str)
 
 try:
     import habana_frameworks.torch.gpu_migration
@@ -237,8 +243,6 @@ unit_tests_to_deselect = {
     ],
     'https://jira.habana-labs.com/browse/SW-238787': [
         'tests/unit_tests/dist_checkpointing/test_async_save.py::TestAsyncSave::test_async_is_equivalent_to_sync[True]',
-        'tests/unit_tests/dist_checkpointing/test_fp8.py::TestFP8::test_fp8_save_load[True-src_tp_pp0-dest_tp_pp0-broadcast]',
-        'tests/unit_tests/dist_checkpointing/test_fp8.py::TestFP8::test_fp8_save_load[False-src_tp_pp2-dest_tp_pp2-None]',
         'tests/unit_tests/models/test_llava_model.py::TestLLaVAModelVisionEncoders::test_constructor[siglip]',
         'tests/unit_tests/test_optimizer.py::test_optim_sharded_state_dict[bf16-False]',
         'tests/unit_tests/test_optimizer.py::test_optim_sharded_state_dict[bf16-True]',

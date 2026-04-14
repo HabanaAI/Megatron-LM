@@ -1,4 +1,4 @@
 regex
 sentencepiece
-tensorboard==2.20
+tensorboard==2.12
 transformers

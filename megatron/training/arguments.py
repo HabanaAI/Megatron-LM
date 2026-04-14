@@ -145,12 +145,13 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         for item in arr:
             assert '=' in item
             key, value = item.split('=', 1)
-            assert value.lower() in ["true", "false"]
-            result[key] = value.lower() == "true"
+            assert value.lower() in ["true", "false", "1", "0"]
+            result[key] = value.lower() in ["true", "1"]
         return result
 
     args.fp8_coverage = fp8_coverage_array_to_dict(args.fp8_coverage)
     assert "mlp_row_parallel" in args.fp8_coverage
+    assert "attention" in args.fp8_coverage
 
     # Args to disable MSC
     if not args.enable_msc:
@@ -1709,8 +1710,8 @@ def _add_transformer_engine_args(parser):
         '--fp8-coverage',
         nargs='+',
         type=str,
-        default=["mlp_row_parallel=True"],
-        help='Select options for fp8 model conversion: [mlp_row_parallel]',
+        default=["mlp_row_parallel=True", "attention=True"],
+        help='Select options for fp8 model conversion: [mlp_row_parallel, attention]',
     )
     group.add_argument(
         '--fp8-smooth-swiglu',

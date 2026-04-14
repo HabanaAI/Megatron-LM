@@ -1,4 +1,4 @@
-# © 2024-2025 Intel Corporation
+# © 2024-2026 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod

@@ -270,4 +270,3 @@ export HL_TOKEN_DISPATCHER_TYPE=alltoall  # allgather or alltoall
 # Known Issues
 * Deepseek model was tested with 4k sequnce length.
 * Only scripts and configurations mentioned in this README are supported and verified.
-* MoE models may encounter distributed checkpointing validation errors.

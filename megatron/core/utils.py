@@ -27,6 +27,7 @@ from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
+from packaging.version import Version as PkgVersion
 
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version

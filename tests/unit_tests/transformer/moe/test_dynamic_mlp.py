@@ -47,7 +47,7 @@ class TestIntelDynamicMLP:
         tf_config = TransformerConfig(
             num_layers=num_layers,
             hidden_size=self.hidden_size,
-            num_attention_heads=4,
+            num_attention_heads=8,
             num_moe_experts=self.num_experts,
             activation_func=self.activation_func,
             use_cpu_initialization=cpu_init,
@@ -58,6 +58,8 @@ class TestIntelDynamicMLP:
             params_dtype=torch.bfloat16,
             moe_router_load_balancing_type="aux_loss",
             moe_router_topk=2,
+            tensor_model_parallel_size=tp_size,
+            sequence_parallel=True if tp_size > 1 else False,
         )
 
         self.fc1_ffn_hidden_size = tf_config.ffn_hidden_size

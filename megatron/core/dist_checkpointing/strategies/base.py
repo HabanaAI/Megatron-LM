@@ -1,3 +1,4 @@
+# © 2025-2026 Intel Corporation
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Strategies base interfaces. """
@@ -220,9 +221,21 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Each async strategy can be trivially used as a sync strategy."""
-        async_request = self.async_save(sharded_state_dict, checkpoint_dir)
-        # multiprocessing routines  may cause issue when called on parent process
-        # We keep this verbose call for now
-        global async_calls
-        async_calls.schedule_async_request(async_request)
-        async_calls.maybe_finalize_async_calls(blocking=True)
+
+        from megatron.core.utils import is_real_cuda_device_available
+
+        if is_real_cuda_device_available():
+            async_request = self.async_save(sharded_state_dict, checkpoint_dir)
+            # multiprocessing routines  may cause issue when called on parent process
+            # We keep this verbose call for now
+            global async_calls
+            async_calls.schedule_async_request(async_request)
+            async_calls.maybe_finalize_async_calls(blocking=True)
+        else:
+            # This implementation executes synchronously without spawning any
+            # async processes or ctx.Process - all operations run sequentially.
+            async_request = self.async_save(sharded_state_dict, checkpoint_dir)
+
+            # Execute synchronously without multiprocessing
+            # This avoids mp.Process spawning and runs everything in the main process
+            async_request.execute_sync()

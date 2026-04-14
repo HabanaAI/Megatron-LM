@@ -1,4 +1,4 @@
-# © 2024-2025 Intel Corporation
+# Copyright (C) 2026 Intel Corporation
 # All Rights Reserved.
 #
 # Unauthorized copying of this file or any element(s) within it, via any medium
@@ -7,7 +7,7 @@
 # and is subject to the confidentiality and license agreements under which it
 # was provided.
 
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -29,7 +29,7 @@ from megatron.core.transformer.rmsnorm import RMSNorm
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import divide
-from megatron.core.version_utils import is_habana_frameworks_min_version
+from megatron.core.version_utils import is_habana_frameworks_min_version, is_ite_min_version
 
 try:
     import apex  # pylint: disable=unused-import
@@ -656,6 +656,7 @@ if is_habana_frameworks_min_version("1.21.0.399"):
             is_expert: bool,
             tp_comm_buffer_name: str = None,
             force_disable_fp8=False,
+            tp_group: Optional[torch.distributed.ProcessGroup] = None,
         ):
 
             super().__init__(
@@ -878,6 +879,12 @@ class IntelTEDotProductAttention(te.FusedAttention):
         world_size = parallel_state.get_tensor_model_parallel_world_size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
 
+        extra_kwargs: dict[str, Any] = {}
+
+        if self.config.context_parallel_size > 1 and cp_comm_type is not None:
+            if is_ite_min_version("1.23.0.220"):
+                extra_kwargs["cp_comm_type"] = cp_comm_type
+
         super().__init__(
             scale=softmax_scale,
             attention_dropout=attention_dropout if attention_dropout is not None else 0.0,
@@ -886,6 +893,7 @@ class IntelTEDotProductAttention(te.FusedAttention):
             cp_global_ranks=parallel_state.get_context_parallel_global_ranks(
                 check_initialized=False
             ),
+            **extra_kwargs,
         )
 
     # pylint: disable=missing-function-docstring
@@ -923,6 +931,42 @@ class IntelTEDotProductAttention(te.FusedAttention):
         context_layer = context_layer.view(*new_context_layer_shape)
 
         return context_layer
+
+
+class IntelTEDotProductAttentionFp8Disabled(IntelTEDotProductAttention):
+    """
+    Wrapper for the Intel Transformer-Engine's `FusedAttention` layer.
+
+    This is a specialized version of IntelTEDotProductAttention with FP8 disabled.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        k_channels: Optional[int] = None,
+        v_channels: Optional[int] = None,
+        cp_comm_type: str = "p2p",
+        model_comm_pgs: ModelCommProcessGroups = None,
+        force_disable_fp8=True,
+    ):
+        super().__init__(
+            config=config,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            attention_type=attention_type,
+            attention_dropout=attention_dropout,
+            softmax_scale=softmax_scale,
+            k_channels=k_channels,
+            v_channels=v_channels,
+            cp_comm_type=cp_comm_type,
+            model_comm_pgs=model_comm_pgs,
+            force_disable_fp8=True,
+        )
 
 
 class IntelTEDelayedScaling(te.recipe.DelayedScaling):

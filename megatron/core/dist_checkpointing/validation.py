@@ -1,13 +1,12 @@
-# Copyright (C) 2025 Intel Corporation
+# © 2025-2026 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
+import operator
+import os
 from collections import Counter, defaultdict
 from enum import Enum
 from functools import reduce
-import logging
-import os
-import operator
-from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -168,7 +167,8 @@ def validate_integrity_and_strict_load(
             on all ranks, unexpected keys might differ across ranks. Additionally,
             missing keys might be erroneously empty (depending on `strict` value).
     """
-    missing_keys, unexpected_keys = set(), set()
+    missing_keys: Set[str] = set()
+    unexpected_keys: Set[str] = set()
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
         if ckpt_sharded_metadata is None:
             raise CheckpointingException(
@@ -255,8 +255,10 @@ def verify_checkpoint_and_load_strategy(
             saved_config.common_backend_version,
         )
     elif isinstance(common_strategy, tuple):
-        sharded_strategy = get_default_strategy(StrategyAction.LOAD_COMMON, *common_strategy)
+        common_strategy = get_default_strategy(StrategyAction.LOAD_COMMON, *common_strategy)
 
+    assert isinstance(sharded_strategy, LoadShardedStrategy)
+    assert isinstance(common_strategy, LoadCommonStrategy)
     sharded_strategy.check_backend_compatibility(saved_config.sharded_backend)
     sharded_strategy.check_version_compatibility(saved_config.sharded_backend_version)
     common_strategy.check_backend_compatibility(saved_config.common_backend)
@@ -388,8 +390,8 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
 
     # Gather the common state dict across ranks onto rank 0 for comparison
     rank = torch.distributed.get_rank()
-    other_rank_state_dicts = [None] * torch.distributed.get_world_size() if rank == 0 else None
-    torch.distributed.gather_object(common_state_dict, other_rank_state_dicts)
+    other_rank_state_dicts = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(other_rank_state_dicts, common_state_dict)
     common_state_dict_diff = {}
     if rank == 0:
         assert other_rank_state_dicts
@@ -407,6 +409,8 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
             logger.warning(
                 f"There is difference in the common state dict in different ranks. The differences are {common_state_dict_diff}"
             )
+    else:
+        del other_rank_state_dicts
 
 
 def skip_warning_for_key(dict_diff, state_dict, key):

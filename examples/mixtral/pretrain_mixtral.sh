@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# © 2024-2025 Intel Corporation
+# © 2024-2026 Intel Corporation
 
 # -------------------------------------------
 # Mixtral model
@@ -102,7 +102,7 @@ RECOMPUTE_NUM_LAYERS=${HL_RECOMPUTE_NUM_LAYERS:-1}
 
 CHECKPOINT_SAVE=${HL_SAVE:-0}
 SAVE_INTERVAL=${HL_SAVE_INTERVAL:-2000}
-CKPT_FORMAT=${HL_CKPT_FORMAT:-torch} # torch, torch_dist and zarr
+CKPT_FORMAT=${HL_CKPT_FORMAT:-torch_dist} # torch, torch_dist and zarr
 CKPT_CONVERT_FORMAT=${HL_CKPT_CONVERT_FORMAT:-}
 CKPT_CONVERT_SAVE=${HL_CKPT_CONVERT_SAVE:-}
 OVERRIDE_OPT_PARAM_SCHEDULER=${HL_OVERRIDE_OPT_PARAM_SCHEDULER:-0}
@@ -132,7 +132,8 @@ TRANSFORMER_IMPL=${HL_TRANSFORMER_IMPL:-transformer_engine}
 FP8_FORMAT=${HL_FP8_FORMAT:-hybrid} # hybrid or e5m2
 FP8_MARGIN=${HL_FP8_MARGIN:-0}
 FP8_AMAX_COMPUTE_ALGO=${HL_FP8_AMAX_COMPUTE_ALGO:-max} # max or most_recent
-FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=False"}
+USE_FUSED_SDPA_FP8=${HL_USE_FUSED_SDPA_FP8:-$(( USE_FUSED_SDPA && FP8 ))} # Set HL_USE_FUSED_SDPA_FP8=0 in case of issues with fused sdpa fp8
+FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=True attention=${USE_FUSED_SDPA_FP8}"}
 FP8_SMOOTH_SWIGLU=${HL_FP8_SMOOTH_SWIGLU:-0}
 FP8_FORCE_SEQ_MOE=${HL_FP8_FORCE_SEQ_MOE:-0}
 MOE_GROUPED_GEMM=${HL_MOE_GROUPED_GEMM:-0}

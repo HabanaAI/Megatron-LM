@@ -1,4 +1,5 @@
 einops
+flask-restful
 junitparser
 mock
 numpy
@@ -9,6 +10,7 @@ pytest_mock
 scipy
 tiktoken
 wrapt
+flask-restful
 nltk
 pytest-random-order
 sentencepiece
@@ -19,4 +21,3 @@ wandb
 transformers
 multi-storage-client
 boto3
-flask

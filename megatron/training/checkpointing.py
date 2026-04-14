@@ -54,6 +54,7 @@ except Exception:
     has_nvidia_modelopt = False
 
 _CHECKPOINT_VERSION = None
+_CHECKPOINT_TYPE = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
@@ -69,6 +70,19 @@ def set_checkpoint_version(value):
 def get_checkpoint_version():
     global _CHECKPOINT_VERSION
     return _CHECKPOINT_VERSION
+
+
+def set_checkpoint_type(value):
+    global _CHECKPOINT_TYPE
+    if _CHECKPOINT_TYPE is not None:
+        assert _CHECKPOINT_TYPE == value, \
+            "checkpoint types do not match"
+    _CHECKPOINT_TYPE = value
+
+
+def get_checkpoint_type():
+    global _CHECKPOINT_TYPE
+    return _CHECKPOINT_TYPE
 
 
 def check_checkpoint_args(checkpoint_args):
@@ -241,39 +255,6 @@ def checkpoint_exists(checkpoints_path):
     return isfile(path)
 
 
-def get_checkpoint_format_and_version(args):
-    iteration = -1
-    if checkpoint_exists(args.load):
-        # Retrieve the checkpoint format from the checkpoint
-        tracker_filename = get_checkpoint_tracker_filename(args.load)
-        if os.path.isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
-            checkpoint_dir = get_checkpoint_name(args.load, iteration, release, return_base_dir=True)
-            ckpt_format = 'torch_dist' if dist_checkpointing.check_is_distributed_checkpoint(checkpoint_dir) else 'torch'
-
-            state_dict = None
-            if ckpt_format == 'torch':
-                # Retrieve the checkpoint version from the checkpoint
-                checkpoint_name = get_checkpoint_name(args.load, iteration, release, return_base_dir=False)
-                try:
-                    state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
-                except Exception as e:
-                    print('could not load the checkpoint')
-                    print(e)
-                    sys.exit()
-
-            # No need to know checkpoint version at this point for 'torch_dist'
-            ckpt_version = state_dict['checkpoint_version'] if ckpt_format == 'torch' else None
-            del state_dict
-                
-
-    # If no checkpoint is provided, use ckpt_format from the arguments and the default checkpoint version.
-    if iteration == -1:
-        ckpt_format = args.ckpt_format
-        ckpt_version = 3.1 if ckpt_format == 'torch' else None
-
-    return ckpt_format, ckpt_version
-
 def read_metadata(tracker_filename):
     # Read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
@@ -354,6 +335,23 @@ class CheckpointType(Enum):
     GLOBAL = auto()
     TORCH_DCP = auto()
 
+
+def checkpoint_type_to_format(ckpt_type: CheckpointType):
+    ckpt_format = None
+    if ckpt_type == CheckpointType.TORCH_DCP:
+        ckpt_format = "torch_dcp"
+    elif ckpt_type == CheckpointType.LEGACY:
+        ckpt_format = "torch"
+    elif ckpt_type in [CheckpointType.LOCAL, CheckpointType.GLOBAL]:
+        ckpt_format = "torch_dist"
+    elif ckpt_type is None:
+        pass    # Not loaded.
+    else:
+        raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
+
+    return ckpt_format
+
+
 def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
 
@@ -372,6 +370,15 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
         else:
             metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
     return metadata
+
+def repair_checkpoint(state_dict):
+    in_state_dict = state_dict
+    out_state_dict = {}
+    for src_key in in_state_dict.keys():
+        dest_key = src_key.replace("_orig_mod.", '') if "orig_mod." in src_key else src_key
+        out_state_dict[dest_key] = in_state_dict[src_key]
+    return out_state_dict
+
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
@@ -1136,6 +1143,11 @@ def load_args_from_checkpoint(
     checkpoint_args = state_dict['args']
     checkpoint_version = state_dict.get('checkpoint_version', 0)
     args.iteration = state_dict['iteration']
+
+    # Set checkpoint version.
+    set_checkpoint_version(checkpoint_version)
+    # Set checkpoint type.
+    set_checkpoint_type(ckpt_type)
 
     # One-off conversion for foundation models
     if hasattr(checkpoint_args, 'disable_bias_linear'):

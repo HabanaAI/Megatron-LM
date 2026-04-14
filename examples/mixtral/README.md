@@ -14,7 +14,7 @@ Before you get started, make sure to review the [Supported Configurations](../..
 # Setup
 Please follow the instructions provided in the [Intel Gaudi Installation Guide](https://docs.habana.ai/en/latest/Installation_Guide/index.html)
 to set up the environment including the `$PYTHON` environment variable. To achieve the best performance, please follow the methods outlined in the [Optimizing Training Platform guide](https://docs.habana.ai/en/latest/PyTorch/Model_Optimization_PyTorch/Optimization_in_Training_Platform.html).
-The guides will walk you through the process of setting up your system to run the model on Gaudi 2 and Gaudi 3.
+The guides will walk you through the process of setting up your system to run the model on Gaudi 2.
 
 ## How to Use
 Users bear sole liability and responsibility to follow and comply with any third party licenses, and Habana Labs disclaims and will bear no liability with respect to users’ use or compliance with third party licenses.
@@ -98,15 +98,15 @@ These are system specific settings. Use these parameters for efficient allocatio
   ```
   HL_TOKENIZER_MODEL=path/to/tokenizer.model
   ```
-* To run in torch.compile mode
-  ```
-  HL_USE_TORCH_COMPILE=1
-  HL_USE_TORCH_COMPILED_AUTOGRAD=0
-  HL_USE_LAZY_MODE=0
-  ```
 * To run in lazy mode
   ```
   HL_USE_LAZY_MODE=1
+  ```
+* To run in torch compile mode
+  ```
+  HL_USE_LAZY_MODE=0
+  HL_USE_TORCH_COMPILE=1
+  HL_USE_TORCH_COMPILED_AUTOGRAD=0
   ```
 * To run in pure eager mode
   ```
@@ -151,10 +151,12 @@ More information on these settings can be found in the main README section.
 * For configurations with MoE Capacity Factor or Capacity Bins, use AllToAll Token Dispatcher. The AllGather Token Dispatcher is sufficient for basic drop\dropless mode.
 * Tensor, Data, Expert, and Pipeline Parallel modes have been validated with the HPU Fused MoE Kernel and other MoE configurations.
 
-The following Mixtral 8x7B configuration has been validated as the most effective for Gaudi 2 and Gaudi 3:
-4DP+8TP+SP with 8 experts top-2, 32k sequence length, Aux Loss for load balancing and micro batch 1.
+### The most effective configuration for Mixtral 8x7B:
+|          | Configuration  | Mode           | Data type  | Seq-len  | topk  | Load balancing |
+|----------|---------------------------------|------------|------------------------------------
+| Gaudi 2  | 2DP-8TP-2CP-SP | torch.compile  | bf16       | 32k      | 2     | Aux Loss       |
 
-### Run Mixtral 8x7b on 32 HPUs, torch.compile mode, with BF16 precision, sequence length 32k:
+### Run Mixtral 8x7b on 32 HPUs, torch compile mode, with BF16 precision, sequence length 32k:
   ```
   HL_HOSTSFILE=$MEGATRON_LM_ROOT/examples/hostsfile \
   HL_NUM_NODES=4 \
@@ -165,32 +167,13 @@ The following Mixtral 8x7B configuration has been validated as the most effectiv
   HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1 \
   HL_MOE_DYNAMIC=1 \
   HL_DIST_OPTIMIZER=1 \
-  HL_MICRO_BATCH=1 \
+  HL_USE_LAZY_MODE=0 \
   HL_USE_TORCH_COMPILE=1 \
   HL_USE_TORCH_COMPILED_AUTOGRAD=0 \
-  HL_USE_LAZY_MODE=0 \
   $MEGATRON_LM_ROOT/examples/mixtral/pretrain_mixtral.sh
   ```
 
-The following Mixtral 8x7B configuration has been validated as the most effective for Gaudi 3:
-4DP+8TP+SP with 8 experts top-2, 32k sequence length, Aux Loss for load balancing and micro batch 2.
-
-### Run Mixtral 8x7b on 32 HPUs, lazy mode, with BF16 precision, sequence length 32k:
-  ```
-  HL_HOSTSFILE=$MEGATRON_LM_ROOT/examples/hostsfile \
-  HL_NUM_NODES=4 \
-  HL_DP=4 \
-  HL_TP=8 \
-  HL_SEQ_PARALLEL=1 \
-  HL_CKP_ACT=3 \
-  HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1 \
-  HL_MOE_DYNAMIC=1 \
-  HL_DIST_OPTIMIZER=1 \
-  HL_MICRO_BATCH=2 \
-  $MEGATRON_LM_ROOT/examples/mixtral/pretrain_mixtral.sh
-  ```
-
-### Run Mixtral 8x7b on 32 HPUs, t.compile mode with BF16 precision, sequence length 32k and Context Parallelism:
+### Run Mixtral 8x7b on 32 HPUs, torch compile mode, with BF16 precision, sequence length 32k and Context Parallelism:
   ```
   HL_HOSTSFILE=$MEGATRON_LM_ROOT/examples/hostsfile \
   HL_USE_FAST_SOFTMAX=0 \
@@ -203,27 +186,9 @@ The following Mixtral 8x7B configuration has been validated as the most effectiv
   HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1 \
   HL_MOE_DYNAMIC=1 \
   HL_DIST_OPTIMIZER=1 \
-  HL_MICRO_BATCH=1 \
+  HL_USE_LAZY_MODE=0 \
   HL_USE_TORCH_COMPILE=1 \
   HL_USE_TORCH_COMPILED_AUTOGRAD=0 \
-  HL_USE_LAZY_MODE=0 \
-  $MEGATRON_LM_ROOT/examples/mixtral/pretrain_mixtral.sh
-  ```
-
-### Run Mixtral 8x7b on 32 HPUs, lazy mode with BF16 precision, sequence length 32k and Context Parallelism:
-  ```
-  HL_HOSTSFILE=$MEGATRON_LM_ROOT/examples/hostsfile \
-  HL_USE_FAST_SOFTMAX=0 \
-  HL_NUM_NODES=4 \
-  HL_DP=2 \
-  HL_CP=2 \
-  HL_TP=8 \
-  HL_SEQ_PARALLEL=1 \
-  HL_CKP_ACT=0 \
-  HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1 \
-  HL_MOE_DYNAMIC=1 \
-  HL_DIST_OPTIMIZER=1 \
-  HL_MICRO_BATCH=1 \
   $MEGATRON_LM_ROOT/examples/mixtral/pretrain_mixtral.sh
   ```
 
@@ -252,8 +217,7 @@ For more information, please see [tools/checkpoint/README.md](../../tools/checkp
 # Supported Configuration
 | Validated on  | Intel Gaudi Software Version | PyTorch Version | Mode     |
 |---------------|------------------------------|-----------------|----------|
-| Gaudi 2       | 1.23.0                       | 2.9.0           | Training |
-| Gaudi 3       | 1.23.0                       | 2.9.0           | Training |
+| Gaudi 2       | 1.24.0                       | 2.10.0          | Training |
 
 # Known Issues
 * Only scripts and configurations mentioned in this README are supported and verified.

@@ -368,3 +368,4 @@ Note: `HL_USE_LAZY_MODE=0` will run in mixed mode with eager and compile due to 
 # Known Issues
 * Only scripts and configurations mentioned in this README are supported and verified.
 * Accuracy issues may be observed when training in fp8 precision on Gaudi3.
+* FP8 accuracy regression observed on Ubuntu 24.04 when training LLaMA2-7B. Root cause: GCC version sensitivity in the FP8 code path (GCC 13.3, default on U24). Does not affect Ubuntu 22.04 configurations.

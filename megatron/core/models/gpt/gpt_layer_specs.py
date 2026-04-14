@@ -41,8 +41,8 @@ from megatron.core.version_utils import is_habana_frameworks_min_version
 
 try:
     from megatron.core.extensions.intel_transformer_engine import (
-        IntelTEColumnParallelLinear,
         IntelTEDotProductAttention,
+        IntelTEDotProductAttentionFp8Disabled,
         IntelTENorm,
         IntelTERowParallelLinear,
         IntelTERowParallelLinearFp8Disabled,
@@ -55,14 +55,7 @@ except:
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
-    from megatron.core.extensions.transformer_engine import (
-        TEColumnParallelLinear,
-        TEDotProductAttention,
-        TEFusedMLP,
-        TELayerNormColumnParallelLinear,
-        TENorm,
-        TERowParallelLinear,
-    )
+    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
     HAVE_TE = True
@@ -159,21 +152,18 @@ def get_gpt_layer_with_transformer_engine_spec(
         use_te_op_fuser=use_te_op_fuser,
     )
 
+    core_attention_class = backend.core_attention()
     if use_intel_te:
-
         if is_habana_frameworks_min_version("1.21.0") and enable_fsdpa:
-            core_attention_class = IntelTEDotProductAttention
+            core_attention_class = (
+                IntelTEDotProductAttention
+                if fp8_coverage.get('attention', True)
+                else IntelTEDotProductAttentionFp8Disabled
+            )
         else:
             core_attention_class = FusedDotProductAttention if enable_fsdpa else DotProductAttention
-        linear_col_proj = IntelTEColumnParallelLinear
-        linear_proj = IntelTERowParallelLinear
-        linear_qkv = IntelTEColumnParallelLinear
         normalization_class = IntelTENorm
     else:
-        core_attention_class = TEDotProductAttention
-        linear_col_proj = TEColumnParallelLinear
-        linear_proj = TERowParallelLinear
-        linear_qkv = TELayerNormColumnParallelLinear
         normalization_class = TENorm
 
     if multi_latent_attention:
@@ -201,7 +191,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                         linear_q_up_proj=linear_q_up_proj,
                         linear_kv_down_proj=backend.column_parallel_linear(),
                         linear_kv_up_proj=linear_kv_up_proj,
-                        core_attention=backend.core_attention(),
+                        core_attention=core_attention_class,
                         linear_proj=backend.row_parallel_linear(),
                         q_layernorm=(
                             IdentityOp
@@ -244,7 +234,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                             if HAVE_TE
                             else backend.column_parallel_linear()
                         ),
-                        core_attention=backend.core_attention(),
+                        core_attention=core_attention_class,
                         linear_proj=backend.row_parallel_linear(),
                         q_layernorm=(
                             L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)

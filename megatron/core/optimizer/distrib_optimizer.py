@@ -1,4 +1,4 @@
-# © 2024-2025 Intel Corporation
+# © 2024-2026 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron distributed optimizer."""
@@ -2026,7 +2026,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
         state_dict = None
         if self.data_parallel_group.rank() == 0:
-            state_dict = torch.load(filename)
+            state_dict = torch.load(filename, weights_only=False)
 
         self.load_parameter_state_from_dp_zero(
             state_dict, update_legacy_format=update_legacy_format

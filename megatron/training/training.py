@@ -1,4 +1,4 @@
-# © 2024-2025 Intel Corporation
+# © 2024-2026 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain utilities."""
@@ -54,12 +54,12 @@ from megatron.core.utils import (
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.transformer.module import Float16Module
 from megatron.training.checkpointing import (
-    get_checkpoint_format_and_version,
     get_checkpoint_version,
-    set_checkpoint_version,
+    get_checkpoint_type,
     load_checkpoint,
     save_checkpoint,
-    checkpoint_exists
+    checkpoint_exists,
+    checkpoint_type_to_format
 )
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -1298,8 +1298,9 @@ def setup_model_and_optimizer(
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = timers
-    config.ckpt_format, config.ckpt_version = get_checkpoint_format_and_version(args)
-    set_checkpoint_version(config.ckpt_version)
+
+    config.ckpt_version = get_checkpoint_version()
+    config.ckpt_format = checkpoint_type_to_format(get_checkpoint_type())
 
     optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult,
@@ -1692,6 +1693,16 @@ def training_log(
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
+            writer.add_scalar(
+                key + ' vs tokens',
+                loss_dict[key],
+                args.consumed_train_samples * args.seq_length
+            )
+            writer.add_scalar(
+                f"lm-loss-training/{key}" + ' vs tokens',
+                loss_dict[key],
+                args.consumed_train_samples * args.seq_length
+            )
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
         if args.log_loss_scale_to_tensorboard:
@@ -1707,6 +1718,16 @@ def training_log(
         if grad_norm is not None:
             writer.add_scalar('grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
+            writer.add_scalar(
+                'grad-norm vs tokens',
+                grad_norm,
+                args.consumed_train_samples * args.seq_length
+            )
+            writer.add_scalar(
+                'grad-norm/grad-norm vs tokens',
+                grad_norm,
+                args.consumed_train_samples * args.seq_length
+            )
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
         if num_zeros_in_grad is not None:
@@ -2798,10 +2819,20 @@ def evaluate_and_print_results(
                 total_loss_dict[key].item(),
                 args.consumed_train_samples,
             )
+            writer.add_scalar(
+                '{} validation vs tokens'.format(key),
+                total_loss_dict[key].item(),
+                args.consumed_train_samples * args.seq_length
+            )
             if args.log_validation_ppl_to_tensorboard:
                 writer.add_scalar('{} validation ppl'.format(key), ppl, iteration)
                 writer.add_scalar(
                     '{} validation ppl vs samples'.format(key), ppl, args.consumed_train_samples
+                )
+                writer.add_scalar(
+                    '{} validation ppl vs tokens'.format(key),
+                    ppl,
+                    args.consumed_train_samples * args.seq_length
                 )
             if wandb_writer and is_last_rank():
                 wandb_writer.log(

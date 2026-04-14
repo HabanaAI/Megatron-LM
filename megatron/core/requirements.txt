@@ -4,3 +4,4 @@ pybind11
 torch
 tensorstore!=0.1.46,!=0.1.72
 zarr
+pyyaml

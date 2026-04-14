@@ -173,7 +173,7 @@ class MLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel + bias_parallel
             if self.config.gated_linear_unit:
 
-                if self.config.fp8_smooth_swiglu and self.training:
+                if self.config.fp8_smooth_swiglu:
                     return self.linear_fc2(intermediate_parallel)
 
                 def glu(x):

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# © 2024-2025 Intel Corporation
+# © 2024-2026 Intel Corporation
 
 set -ex
 
@@ -25,9 +25,10 @@ OUTPUT_DIR=${HL_RESULTS_DIR:-}
 OUTPUT_DIR_PREFIX=${HL_RESULTS_DIR_PREFIX:-.}
 CHECKPOINT_SAVE=${HL_SAVE:-1}
 SAVE_INTERVAL=${HL_SAVE_INTERVAL:-2000}
-CKPT_FORMAT=${HL_CKPT_FORMAT:-torch} # torch, torch_dist and zarr
+CKPT_FORMAT=${HL_CKPT_FORMAT:-torch_dist} # torch, torch_dist and zarr
 CKPT_CONVERT_FORMAT=${HL_CKPT_CONVERT_FORMAT:-}
 CKPT_CONVERT_SAVE=${HL_CKPT_CONVERT_SAVE:-}
+CKPT_FULLY_PARALLEL_LOAD=${HL_CKPT_FULLY_PARALLEL_LOAD:-0}
 USE_DISTRIBUTED_OPTIMIZER=${HL_USE_DISTRIBUTED_OPTIMIZER:-1}
 SAVE_DISTRIB_OPTIMIZER_METHOD=${HL_SAVE_DISTRIB_OPTIMIZER_METHOD:-serial_per_node}
 LOAD_DISTRIB_OPTIMIZER_METHOD=${HL_LOAD_DISTRIB_OPTIMIZER_METHOD:-serial_per_dp_groups}
@@ -73,7 +74,8 @@ CACHE_SIZE_LIMIT=${HL_CACHE_SIZE_LIMIT:-0}
 USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
 SKIP_TRAIN=${HL_SKIP_TRAIN:-0}
 NUM_WORKERS=${HL_NUM_WORKERS:-2}
-FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=True"}
+USE_FUSED_SDPA_FP8=${HL_USE_FUSED_SDPA_FP8:-$(( USE_FUSED_SDPA && FP8 ))} # Set HL_USE_FUSED_SDPA_FP8=0 in case of issues with fused sdpa fp8
+FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=True attention=${USE_FUSED_SDPA_FP8}"}
 CACHE_FP8_WEIGHT=${HL_CACHE_FP8_WEIGHT:-1}
 CACHE_FP8_WEIGHT_FWD=${HL_CACHE_FP8_WEIGHT_FWD:-1}
 ENV_FLAGS=${HL_ENV_FLAGS:-} #"a=1,b=2,c=3"
@@ -477,7 +479,7 @@ CMD="${CMD} \
     --eval-iters ${EVAL_ITERS} \
     --data-path ${DATA_PATH} \
     --num-workers ${NUM_WORKERS} \
-    --distributed-timeout-minutes 60 \
+    --distributed-timeout-minutes 120 \
     --use-te-custom-op ${USE_TE_CUSTOM_OP} \
     "
 
@@ -605,6 +607,10 @@ if [[ -n "${CKPT_CONVERT_FORMAT}" ]]; then
     CMD="${CMD} --ckpt-convert-format ${CKPT_CONVERT_FORMAT}"
     CMD="${CMD} --ckpt-convert-save ${CKPT_CONVERT_SAVE}"
     CMD="${CMD} --auto-detect-ckpt-format"
+fi
+
+if [[ "${CKPT_FULLY_PARALLEL_LOAD}" -eq 1 ]]; then
+    CMD="${CMD} --ckpt-fully-parallel-load"
 fi
 
 if [[ "${OVERRIDE_OPT_PARAM_SCHEDULER}" -eq 1 && "${USE_CKPT_OPT_PARAM_SCHEDULER}" -eq 1 ]]; then

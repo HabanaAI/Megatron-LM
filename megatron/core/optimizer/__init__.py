@@ -1,4 +1,4 @@
-# Copyright (C) 2025 Intel Corporation
+# © 2025-2026 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
@@ -151,14 +151,19 @@ def _get_param_groups(
     # runtime error when loading the checkpoint or numerical error when resuming training.
     params_key = list(params_map.keys())
     gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather_object(gathered_params_key, params_key)
+
+    if torch.distributed.is_initialized():
+        torch.distributed.all_gather_object(gathered_params_key, params_key)
+
     for keys in gathered_params_key:
         for key in keys:
             if key not in params_key:
                 params_key.append(key)
 
-    align_param_groups = torch.distributed.is_initialized() and (
-        (ckpt_version is not None and ckpt_version > 3.0) or ckpt_format == 'torch_dist'
+    # Align param groups when distributed is initialized
+    # and not using legacy torch checkpoint (<3.1)
+    align_param_groups = torch.distributed.is_initialized() and not (
+        ckpt_version is not None and ckpt_version < 3.1 and ckpt_format == 'torch'
     )
 
     if align_param_groups:

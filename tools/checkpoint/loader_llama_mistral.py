@@ -1,4 +1,4 @@
-# © 2024-2025 Intel Corporation
+# © 2024-2026 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import json
@@ -50,7 +50,7 @@ def add_arguments(parser):
 
 def verify_transformers_version():
     major, minor, patch = map(int, transformers.__version__.split('.'))
-    assert major >= 4 and minor >= 31
+    assert major >= 4 or (major >= 4 and minor >= 31)
 
 
 NUM_SHARDS = {
@@ -604,7 +604,7 @@ def _load_checkpoint(queue, args):
     # Suppress warning about torch.distributed not being initialized.
     module.MegatronModule.embedding_warning_printed = True
 
-    set_global_variables(margs, build_tokenizer=True)
+    set_global_variables(margs, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)

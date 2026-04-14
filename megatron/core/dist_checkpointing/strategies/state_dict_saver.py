@@ -1,3 +1,4 @@
+# © 2025-2026 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ State dict saver for PyT Distributed format allowing asynchronous save. """
@@ -46,7 +47,13 @@ def save_state_dict_async_plan(
     planner: Optional[Union[SavePlanner, 'MCoreSavePlanner']] = None,
     cached_ckpt_structure: Optional[Tuple[SavePlan, SavePlan, bool]] = None,
     loaded_all_plans: Optional[List[SavePlan]] = None,
-) -> Tuple[Tuple['FileSystemWriterAsync', Union[Metadata, None], _DistWrapper], SavePlan, bool]:
+) -> Tuple[
+    Tuple['FileSystemWriterAsync', Union[Metadata, None], _DistWrapper],
+    SavePlan,
+    Optional[SavePlan],
+    bool,
+    bool,
+]:
     """
     First stage of saving a state dict to storage.
 
@@ -138,7 +145,7 @@ def save_state_dict_async_plan(
         )
 
         if not loaded_all_plans or not global_md_verify_reuse:
-            all_local_plans = dist_wrapper.gather_object(local_plan)
+            all_local_plans = dist_wrapper.all_gather_object(local_plan)
             if dist_wrapper.is_coordinator:
                 _, global_metadata = planner.create_global_plan(all_local_plans)
                 global_metadata.all_local_plans = all_local_plans
@@ -169,7 +176,10 @@ def save_state_dict_async_plan(
 
 
 def verify_global_md_reuse(
-    loaded_all_plans: List[SavePlan], local_plan: SavePlan, rank: int, dist_wrapper: _DistWrapper
+    loaded_all_plans: Optional[List[SavePlan]],
+    local_plan: SavePlan,
+    rank: int,
+    dist_wrapper: _DistWrapper,
 ) -> bool:
     """
     Verifies that global metadata reuse is possible by checking the loaded plans from the
@@ -230,7 +240,7 @@ def save_state_dict_async_finalize(
 
     # Gather the write results that will be saved to the metadata file.
     gather_start = time()
-    all_results = dist_wrapper.gather_object(write_results)
+    all_results = dist_wrapper.all_gather_object(write_results)
     gather_end = time()
     logger.debug(f"{gather_end}, {torch.distributed.get_rank()}, gather: {gather_end-gather_start}")
 
